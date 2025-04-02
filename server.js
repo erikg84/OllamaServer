@@ -390,15 +390,25 @@ app.get('/models', async (req, res) => {
             });
 
             try {
-                // Use /tags endpoint instead of /list
                 const response = await axios.get(`${LLAMA_BASE_URL}/tags`);
+
+                // Transform the data to match what the Kotlin service expects
+                const transformedModels = response.data.models.map(model => ({
+                    id: model.model,
+                    name: model.name || model.model,
+                    type: model.details?.family || "unknown",
+                    size: model.size,
+                    quantization: model.details?.quantization_level || "unknown"
+                }));
+
                 logger.info({
                     message: 'Models list API call successful',
                     requestId,
                     duration: `${Date.now() - startTime}ms`,
-                    modelsCount: response.data.models ? response.data.models.length : 'undefined'
+                    modelsCount: transformedModels.length
                 });
-                return response;
+
+                return { data: transformedModels };
             } catch (error) {
                 logger.error({
                     message: 'Models list API call failed',
@@ -416,6 +426,7 @@ app.get('/models', async (req, res) => {
             duration: `${Date.now() - startTime}ms`
         });
 
+        // Return the transformed array directly, not nested in an object
         res.json(result.data);
     } catch (error) {
         logger.error({
