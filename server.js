@@ -988,7 +988,7 @@ app.get('/admin/metrics', (req, res) => {
     res.json({
         status: 'ok',
         data: {
-            ...metrics,
+            ...systemMetrics(),
             system: systemStats
         }
     });
@@ -1002,6 +1002,35 @@ app.get('/admin/metrics', (req, res) => {
         timestamp: new Date().toISOString()
     });
 });
+
+function systemMetrics() {
+    const enhancedMetrics = {
+        responseTimes: { ...metrics.responseTimes },
+        requestCounts: [...metrics.requestCounts],
+        nodePerformance: { ...metrics.nodePerformance },
+        modelPerformance: { ...metrics.modelPerformance }
+    };
+
+    const activeNodes = Object.keys(enhancedMetrics.nodePerformance);
+
+    if (enhancedMetrics.requestCounts.length === 0) {
+        enhancedMetrics.requestCounts = Array.from({ length: 12 }, (_, i) => ({
+            time: `${i * 5}m`,
+            value: 0
+        }));
+    }
+
+    activeNodes.forEach(nodeId => {
+        if (!enhancedMetrics.responseTimes[nodeId]) {
+            enhancedMetrics.responseTimes[nodeId] = Array.from({ length: 12 }, (_, i) => ({
+                time: `${i * 5}m`,
+                value: 0 
+            }));
+        }
+    });
+
+    return enhancedMetrics;
+}
 
 // Get system information
 app.get('/admin/system', (req, res) => {
