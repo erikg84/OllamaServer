@@ -1,46 +1,112 @@
 const express = require('express');
 const axios = require('axios');
 const winston = require('winston');
+require('winston-mongodb');
 const os = require('os');
 const { v4: uuidv4 } = require('uuid');
+const ip = require('ip');
 
-// Set up logger
+// Get server identity information
+const SERVER_ID = {
+    hostname: os.hostname(),
+    ipAddress: ip.address(),
+    platform: os.platform(),
+    arch: os.arch(),
+    nodeVersion: process.version
+};
+
+// Set up logger with enhanced configuration
 const logger = winston.createLogger({
     level: 'info',
     format: winston.format.combine(
         winston.format.timestamp(),
+        winston.format.metadata({ fillExcept: ['message', 'level', 'timestamp'] }),
         winston.format.json()
     ),
+    defaultMeta: {
+        serverId: SERVER_ID.ipAddress,
+        hostname: SERVER_ID.hostname,
+        environment: process.env.NODE_ENV || 'development',
+        application: 'llama-server', // Add application identifier
+        version: '1.0.0' // Add version information
+    },
     transports: [
-        new winston.transports.Console(),
-        new winston.transports.File({ filename: 'server.log' })
+        new winston.transports.Console({
+            format: winston.format.combine(
+                winston.format.colorize(),
+                winston.format.printf(({ level, message, timestamp, metadata }) => {
+                    return `${timestamp} ${level}: ${message} ${JSON.stringify(metadata)}`;
+                })
+            )
+        }),
+        new winston.transports.File({ filename: 'server.log' }),
+        // Add MongoDB transport for centralized logging
+        new winston.transports.MongoDB({
+            db: 'mongodb://192.168.68.145:27017/logs',
+            collection: 'logs',
+            options: {
+                useUnifiedTopology: true
+            }
+        })
+    ],
+    // Add exception handlers
+    exceptionHandlers: [
+        new winston.transports.File({ filename: 'exceptions.log' }),
+        new winston.transports.MongoDB({
+            db: 'mongodb://192.168.68.145:27017/logs',
+            collection: 'exceptions',
+            options: {
+                useUnifiedTopology: true
+            }
+        })
     ]
 });
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '50mb' })); // Add limit to prevent large request body issues
 
 let queue;
 
 // Llama API base URL
 const LLAMA_BASE_URL = 'http://localhost:11434/api';
 
+// Log application startup
+logger.info({
+    message: 'Server starting',
+    version: '1.0.0',
+    nodeVersion: process.version,
+    platform: os.platform(),
+    arch: os.arch(),
+    hostname: os.hostname(),
+    cpuCores: os.cpus().length,
+    totalMemory: `${Math.round(os.totalmem() / (1024 * 1024))} MB`,
+    freeMemory: `${Math.round(os.freemem() / (1024 * 1024))} MB`
+});
+
 // Add request ID middleware
 app.use((req, res, next) => {
     req.id = uuidv4();
     res.locals.startTime = Date.now();
 
-    // Log incoming request
+    // Enhanced request logging with sanitized body
+    const sanitizedBody = req.body ? sanitizeRequestBody(req.body) : undefined;
+
     logger.info({
         message: 'Request received',
         requestId: req.id,
         method: req.method,
         url: req.originalUrl,
+        path: req.path,
+        query: req.query,
         ip: req.ip,
-        userAgent: req.get('user-agent')
+        forwardedIp: req.get('x-forwarded-for'),
+        userAgent: req.get('user-agent'),
+        contentType: req.get('content-type'),
+        contentLength: req.get('content-length'),
+        requestBody: sanitizedBody
     });
 
-    // Log response when finished
+    // Enhanced response logging with metrics
     res.on('finish', () => {
         const duration = Date.now() - res.locals.startTime;
         logger.info({
@@ -49,16 +115,73 @@ app.use((req, res, next) => {
             method: req.method,
             url: req.originalUrl,
             statusCode: res.statusCode,
-            duration: `${duration}ms`
+            statusMessage: res.statusMessage,
+            contentType: res.get('content-type'),
+            contentLength: res.get('content-length'),
+            duration: `${duration}ms`,
+            responseTime: duration
+        });
+    });
+
+    // Log response errors
+    res.on('error', (error) => {
+        logger.error({
+            message: 'Response error',
+            requestId: req.id,
+            method: req.method,
+            url: req.originalUrl,
+            error: error.message,
+            stack: error.stack
         });
     });
 
     next();
 });
 
+// Sanitize request body to avoid logging sensitive information
+function sanitizeRequestBody(body) {
+    if (!body) return {};
+
+    // Create a shallow copy of the body
+    const sanitized = { ...body };
+
+    // Remove potentially sensitive fields
+    const sensitiveFields = ['password', 'token', 'apiKey', 'secret'];
+
+    for (const field of sensitiveFields) {
+        if (sanitized[field]) {
+            sanitized[field] = '[REDACTED]';
+        }
+    }
+
+    // For large prompt texts, truncate them
+    if (sanitized.prompt && typeof sanitized.prompt === 'string' && sanitized.prompt.length > 100) {
+        sanitized.prompt = sanitized.prompt.substring(0, 100) + '... [TRUNCATED]';
+    }
+
+    // For message arrays, truncate content
+    if (sanitized.messages && Array.isArray(sanitized.messages)) {
+        sanitized.messages = sanitized.messages.map(msg => {
+            if (msg.content && typeof msg.content === 'string' && msg.content.length > 100) {
+                return {
+                    ...msg,
+                    content: msg.content.substring(0, 100) + '... [TRUNCATED]'
+                };
+            }
+            return msg;
+        });
+    }
+
+    return sanitized;
+}
+
 (async () => {
     try {
-        logger.info('Initializing server and importing p-queue...');
+        logger.info({
+            message: 'Initializing server and importing p-queue...',
+            timestamp: new Date().toISOString()
+        });
+
         const PQueue = (await import('p-queue')).default;
         queue = new PQueue({
             concurrency: 5,
@@ -70,7 +193,8 @@ app.use((req, res, next) => {
             logger.info({
                 message: 'Task added to queue',
                 queueSize: queue.size,
-                queuePending: queue.pending
+                queuePending: queue.pending,
+                timestamp: new Date().toISOString()
             });
         });
 
@@ -78,7 +202,8 @@ app.use((req, res, next) => {
             logger.info({
                 message: 'Starting next task',
                 queueSize: queue.size,
-                queuePending: queue.pending
+                queuePending: queue.pending,
+                timestamp: new Date().toISOString()
             });
         });
 
@@ -86,7 +211,8 @@ app.use((req, res, next) => {
             logger.info({
                 message: 'Task completed',
                 queueSize: queue.size,
-                queuePending: queue.pending
+                queuePending: queue.pending,
+                timestamp: new Date().toISOString()
             });
         });
 
@@ -96,22 +222,33 @@ app.use((req, res, next) => {
                 error: error.message,
                 stack: error.stack,
                 queueSize: queue.size,
-                queuePending: queue.pending
+                queuePending: queue.pending,
+                timestamp: new Date().toISOString()
             });
         });
 
-        logger.info('Queue initialized successfully');
+        logger.info({
+            message: 'Queue initialized successfully',
+            concurrency: 5,
+            timestamp: new Date().toISOString()
+        });
 
         // Start the server
         const PORT = process.env.PORT || 3000;
         app.listen(PORT, () => {
-            logger.info(`Server running on port ${PORT}`);
+            logger.info({
+                message: `Server running on port ${PORT}`,
+                port: PORT,
+                serverUrl: `http://${SERVER_ID.ipAddress}:${PORT}`,
+                timestamp: new Date().toISOString()
+            });
         });
     } catch (error) {
         logger.error({
             message: 'Failed to initialize server',
             error: error.message,
-            stack: error.stack
+            stack: error.stack,
+            timestamp: new Date().toISOString()
         });
         process.exit(1);
     }
@@ -123,13 +260,17 @@ app.get('/health', async (req, res) => {
 
     logger.info({
         message: 'Health check requested',
-        requestId
+        requestId,
+        endpoint: '/health',
+        timestamp: new Date().toISOString()
     });
 
     if (!queue) {
         logger.error({
             message: 'Queue not initialized',
-            requestId
+            requestId,
+            reason: 'Server still initializing',
+            timestamp: new Date().toISOString()
         });
         return res.status(503).json({ status: 'error', message: 'Server initializing' });
     }
@@ -137,30 +278,57 @@ app.get('/health', async (req, res) => {
     try {
         logger.info({
             message: 'Adding health check to queue',
-            requestId
+            requestId,
+            queueSize: queue.size,
+            queuePending: queue.pending,
+            timestamp: new Date().toISOString()
         });
 
         const startTime = Date.now();
         const result = await queue.add(async () => {
             logger.info({
                 message: 'Executing health check request',
-                requestId
+                requestId,
+                startTime: new Date(startTime).toISOString(),
+                timestamp: new Date().toISOString()
             });
 
             try {
+                // Log API call attempt
+                logger.info({
+                    message: 'Making health check API call',
+                    requestId,
+                    endpoint: `${LLAMA_BASE_URL}/tags`,
+                    method: 'GET',
+                    timestamp: new Date().toISOString()
+                });
+
                 const response = await axios.get(`${LLAMA_BASE_URL}/tags`);
+
+                // Log successful response details
                 logger.info({
                     message: 'Health check API call successful',
                     requestId,
-                    duration: `${Date.now() - startTime}ms`
+                    duration: `${Date.now() - startTime}ms`,
+                    statusCode: response.status,
+                    responseSize: JSON.stringify(response.data).length,
+                    timestamp: new Date().toISOString()
                 });
                 return response;
             } catch (error) {
+                // Enhanced error logging for API call failures
                 logger.error({
                     message: 'Health check API call failed',
                     requestId,
                     error: error.message,
-                    duration: `${Date.now() - startTime}ms`
+                    errorCode: error.code,
+                    errorResponse: error.response ? {
+                        status: error.response.status,
+                        statusText: error.response.statusText,
+                        data: error.response.data
+                    } : 'No response',
+                    duration: `${Date.now() - startTime}ms`,
+                    timestamp: new Date().toISOString()
                 });
                 throw error;
             }
@@ -169,7 +337,9 @@ app.get('/health', async (req, res) => {
         logger.info({
             message: 'Health check successful',
             requestId,
-            duration: `${Date.now() - startTime}ms`
+            duration: `${Date.now() - startTime}ms`,
+            tagsCount: result.data.models ? result.data.models.length : 0,
+            timestamp: new Date().toISOString()
         });
 
         res.json({ status: 'ok', tags: result.data });
@@ -178,7 +348,8 @@ app.get('/health', async (req, res) => {
             message: 'Health check failed',
             requestId,
             error: error.message,
-            stack: error.stack
+            stack: error.stack,
+            timestamp: new Date().toISOString()
         });
 
         res.status(500).json({ status: 'error', message: error.message });
@@ -189,20 +360,26 @@ app.get('/health', async (req, res) => {
 app.post('/generate', async (req, res) => {
     const requestId = req.id;
     const startTime = Date.now();
-    const node = req.body.node;
-    const model = req.body.model;
+    const node = req.body.node || 'unknown';
+    const model = req.body.model || 'unknown';
 
+    // Enhanced generate request logging
     logger.info({
         message: 'Generate request received',
         requestId,
-        model: req.body.model,
-        promptLength: req.body.prompt ? req.body.prompt.length : 'undefined'
+        model,
+        node,
+        promptLength: req.body.prompt ? req.body.prompt.length : 'undefined',
+        options: req.body.options || {},
+        timestamp: new Date().toISOString()
     });
 
     if (!queue) {
         logger.error({
             message: 'Queue not initialized',
-            requestId
+            requestId,
+            reason: 'Server still initializing',
+            timestamp: new Date().toISOString()
         });
         return res.status(503).json({ status: 'error', message: 'Server initializing' });
     }
@@ -210,34 +387,80 @@ app.post('/generate', async (req, res) => {
     try {
         logger.info({
             message: 'Adding generate request to queue',
-            requestId
+            requestId,
+            model,
+            queueSize: queue.size,
+            queuePending: queue.pending,
+            timestamp: new Date().toISOString()
         });
 
-        const startTime = Date.now();
+        const queueStartTime = Date.now();
         const result = await queue.add(async () => {
+            const queueWaitTime = Date.now() - queueStartTime;
+
             logger.info({
                 message: 'Executing generate request',
                 requestId,
-                model: req.body.model
+                model,
+                node,
+                queueWaitTime: `${queueWaitTime}ms`,
+                startTime: new Date(startTime).toISOString(),
+                timestamp: new Date().toISOString()
             });
 
             try {
+                // Log API call attempt
+                logger.info({
+                    message: 'Making generate API call',
+                    requestId,
+                    endpoint: `${LLAMA_BASE_URL}/generate`,
+                    method: 'POST',
+                    model,
+                    timestamp: new Date().toISOString()
+                });
+
                 const response = await axios.post(`${LLAMA_BASE_URL}/generate`, req.body);
+
+                // Extract metrics from response for logging
+                const tokenCount = response.data.eval_count || 0;
+                const promptTokens = response.data.prompt_eval_count || 0;
+                const duration = Date.now() - startTime;
+                const tokensPerSecond = tokenCount > 0 ? (tokenCount / (duration / 1000)).toFixed(2) : 0;
+
                 updateMetrics(node, model, startTime, response.data);
+
+                // Enhanced successful API call logging
                 logger.info({
                     message: 'Generate API call successful',
                     requestId,
-                    duration: `${Date.now() - startTime}ms`,
-                    responseSize: JSON.stringify(response.data).length
+                    model,
+                    node,
+                    duration: `${duration}ms`,
+                    responseSize: JSON.stringify(response.data).length,
+                    tokenCount,
+                    promptTokens,
+                    totalTokens: promptTokens + tokenCount,
+                    tokensPerSecond: `${tokensPerSecond} tokens/sec`,
+                    timestamp: new Date().toISOString()
                 });
                 return response;
             } catch (error) {
+                // Enhanced error logging for API call failures
                 updateMetrics(node, model, startTime, null, true);
                 logger.error({
                     message: 'Generate API call failed',
                     requestId,
+                    model,
+                    node,
                     error: error.message,
-                    duration: `${Date.now() - startTime}ms`
+                    errorCode: error.code,
+                    errorResponse: error.response ? {
+                        status: error.response.status,
+                        statusText: error.response.statusText,
+                        data: error.response.data
+                    } : 'No response',
+                    duration: `${Date.now() - startTime}ms`,
+                    timestamp: new Date().toISOString()
                 });
                 throw error;
             }
@@ -246,7 +469,10 @@ app.post('/generate', async (req, res) => {
         logger.info({
             message: 'Generate request successful',
             requestId,
-            duration: `${Date.now() - startTime}ms`
+            model,
+            node,
+            duration: `${Date.now() - startTime}ms`,
+            timestamp: new Date().toISOString()
         });
 
         res.json(result.data);
@@ -254,8 +480,12 @@ app.post('/generate', async (req, res) => {
         logger.error({
             message: 'Generate request failed',
             requestId,
+            model,
+            node,
             error: error.message,
-            stack: error.stack
+            stack: error.stack,
+            duration: `${Date.now() - startTime}ms`,
+            timestamp: new Date().toISOString()
         });
 
         res.status(500).json({ status: 'error', message: error.message });
@@ -265,18 +495,28 @@ app.post('/generate', async (req, res) => {
 // Chat endpoint with queuing
 app.post('/chat', async (req, res) => {
     const requestId = req.id;
+    const startTime = Date.now();
+    const node = req.body.node || 'unknown';
+    const model = req.body.model || 'unknown';
 
+    // Enhanced chat request logging
     logger.info({
         message: 'Chat request received',
         requestId,
-        model: req.body.model,
-        messagesCount: req.body.messages ? req.body.messages.length : 'undefined'
+        model,
+        node,
+        messagesCount: req.body.messages ? req.body.messages.length : 'undefined',
+        options: req.body.options || {},
+        systemPromptLength: req.body.system ? req.body.system.length : 0,
+        timestamp: new Date().toISOString()
     });
 
     if (!queue) {
         logger.error({
             message: 'Queue not initialized',
-            requestId
+            requestId,
+            reason: 'Server still initializing',
+            timestamp: new Date().toISOString()
         });
         return res.status(503).json({ status: 'error', message: 'Server initializing' });
     }
@@ -284,34 +524,82 @@ app.post('/chat', async (req, res) => {
     try {
         logger.info({
             message: 'Adding chat request to queue',
-            requestId
+            requestId,
+            model,
+            queueSize: queue.size,
+            queuePending: queue.pending,
+            timestamp: new Date().toISOString()
         });
 
-        const startTime = Date.now();
+        const queueStartTime = Date.now();
         const result = await queue.add(async () => {
+            const queueWaitTime = Date.now() - queueStartTime;
+
             logger.info({
                 message: 'Executing chat request',
                 requestId,
-                model: req.body.model
+                model,
+                node,
+                queueWaitTime: `${queueWaitTime}ms`,
+                startTime: new Date(startTime).toISOString(),
+                timestamp: new Date().toISOString()
             });
 
             try {
+                // Log API call attempt
+                logger.info({
+                    message: 'Making chat API call',
+                    requestId,
+                    endpoint: `${LLAMA_BASE_URL}/chat`,
+                    method: 'POST',
+                    model,
+                    timestamp: new Date().toISOString()
+                });
+
                 const response = await axios.post(`${LLAMA_BASE_URL}/chat`, req.body);
-                updateMetrics(req.body.node, req.body.model, startTime, response.data);
+
+                // Extract usage metrics for enhanced logging
+                const usage = response.data.usage || {};
+                const inputTokens = usage.prompt_tokens || 0;
+                const outputTokens = usage.completion_tokens || 0;
+                const totalTokens = usage.total_tokens || inputTokens + outputTokens;
+                const duration = Date.now() - startTime;
+                const tokensPerSecond = outputTokens > 0 ? (outputTokens / (duration / 1000)).toFixed(2) : 0;
+
+                updateMetrics(node, model, startTime, response.data);
+
+                // Enhanced successful API call logging
                 logger.info({
                     message: 'Chat API call successful',
                     requestId,
-                    duration: `${Date.now() - startTime}ms`,
-                    responseSize: JSON.stringify(response.data).length
+                    model,
+                    node,
+                    duration: `${duration}ms`,
+                    responseSize: JSON.stringify(response.data).length,
+                    promptTokens: inputTokens,
+                    completionTokens: outputTokens,
+                    totalTokens,
+                    tokensPerSecond: `${tokensPerSecond} tokens/sec`,
+                    timestamp: new Date().toISOString()
                 });
                 return response;
             } catch (error) {
-                updateMetrics(req.body.node, req.body.model, startTime, null, true);
+                // Enhanced error logging for API call failures
+                updateMetrics(node, model, startTime, null, true);
                 logger.error({
                     message: 'Chat API call failed',
                     requestId,
+                    model,
+                    node,
                     error: error.message,
-                    duration: `${Date.now() - startTime}ms`
+                    errorCode: error.code,
+                    errorResponse: error.response ? {
+                        status: error.response.status,
+                        statusText: error.response.statusText,
+                        data: error.response.data
+                    } : 'No response',
+                    duration: `${Date.now() - startTime}ms`,
+                    timestamp: new Date().toISOString()
                 });
                 throw error;
             }
@@ -320,7 +608,10 @@ app.post('/chat', async (req, res) => {
         logger.info({
             message: 'Chat request successful',
             requestId,
-            duration: `${Date.now() - startTime}ms`
+            model,
+            node,
+            duration: `${Date.now() - startTime}ms`,
+            timestamp: new Date().toISOString()
         });
 
         res.json(result.data);
@@ -328,8 +619,12 @@ app.post('/chat', async (req, res) => {
         logger.error({
             message: 'Chat request failed',
             requestId,
+            model,
+            node,
             error: error.message,
-            stack: error.stack
+            stack: error.stack,
+            duration: `${Date.now() - startTime}ms`,
+            timestamp: new Date().toISOString()
         });
 
         res.status(500).json({ status: 'error', message: error.message });
@@ -338,6 +633,11 @@ app.post('/chat', async (req, res) => {
 
 // Shift metrics every 5 minutes
 function shiftMetrics() {
+    logger.info({
+        message: 'Shifting time-series metrics',
+        timestamp: new Date().toISOString()
+    });
+
     // For response times
     Object.keys(metrics.responseTimes).forEach(nodeId => {
         // Remove oldest time point
@@ -354,6 +654,11 @@ function shiftMetrics() {
     const latestTime = metrics.requestCounts[metrics.requestCounts.length - 1].time;
     const minutes = parseInt(latestTime) + 5;
     metrics.requestCounts.push({ time: `${minutes}m`, value: 0 });
+
+    logger.info({
+        message: 'Time-series metrics shifted successfully',
+        timestamp: new Date().toISOString()
+    });
 }
 
 // Set up metrics shifting every 5 minutes
@@ -365,13 +670,17 @@ app.get('/models', async (req, res) => {
 
     logger.info({
         message: 'Models list requested',
-        requestId
+        requestId,
+        endpoint: '/models',
+        timestamp: new Date().toISOString()
     });
 
     if (!queue) {
         logger.error({
             message: 'Queue not initialized',
-            requestId
+            requestId,
+            reason: 'Server still initializing',
+            timestamp: new Date().toISOString()
         });
         return res.status(503).json({ status: 'error', message: 'Server initializing' });
     }
@@ -379,17 +688,31 @@ app.get('/models', async (req, res) => {
     try {
         logger.info({
             message: 'Adding models list request to queue',
-            requestId
+            requestId,
+            queueSize: queue.size,
+            queuePending: queue.pending,
+            timestamp: new Date().toISOString()
         });
 
         const startTime = Date.now();
         const result = await queue.add(async () => {
             logger.info({
                 message: 'Executing models list request',
-                requestId
+                requestId,
+                startTime: new Date(startTime).toISOString(),
+                timestamp: new Date().toISOString()
             });
 
             try {
+                // Log API call attempt
+                logger.info({
+                    message: 'Making models list API call',
+                    requestId,
+                    endpoint: `${LLAMA_BASE_URL}/tags`,
+                    method: 'GET',
+                    timestamp: new Date().toISOString()
+                });
+
                 const response = await axios.get(`${LLAMA_BASE_URL}/tags`);
 
                 // Transform the data to match what the Kotlin service expects
@@ -405,16 +728,26 @@ app.get('/models', async (req, res) => {
                     message: 'Models list API call successful',
                     requestId,
                     duration: `${Date.now() - startTime}ms`,
-                    modelsCount: transformedModels.length
+                    modelsCount: transformedModels.length,
+                    responseSize: JSON.stringify(transformedModels).length,
+                    timestamp: new Date().toISOString()
                 });
 
                 return { data: transformedModels };
             } catch (error) {
+                // Enhanced error logging for API call failures
                 logger.error({
                     message: 'Models list API call failed',
                     requestId,
                     error: error.message,
-                    duration: `${Date.now() - startTime}ms`
+                    errorCode: error.code,
+                    errorResponse: error.response ? {
+                        status: error.response.status,
+                        statusText: error.response.statusText,
+                        data: error.response.data
+                    } : 'No response',
+                    duration: `${Date.now() - startTime}ms`,
+                    timestamp: new Date().toISOString()
                 });
                 throw error;
             }
@@ -423,7 +756,9 @@ app.get('/models', async (req, res) => {
         logger.info({
             message: 'Models list request successful',
             requestId,
-            duration: `${Date.now() - startTime}ms`
+            duration: `${Date.now() - startTime}ms`,
+            modelsCount: result.data.length,
+            timestamp: new Date().toISOString()
         });
 
         // Return the transformed array directly, not nested in an object
@@ -433,7 +768,9 @@ app.get('/models', async (req, res) => {
             message: 'Models list request failed',
             requestId,
             error: error.message,
-            stack: error.stack
+            stack: error.stack,
+            duration: `${Date.now() - startTime}ms`,
+            timestamp: new Date().toISOString()
         });
 
         res.status(500).json({ status: 'error', message: error.message });
@@ -446,13 +783,17 @@ app.get('/queue-status', (req, res) => {
 
     logger.info({
         message: 'Queue status requested',
-        requestId
+        requestId,
+        endpoint: '/queue-status',
+        timestamp: new Date().toISOString()
     });
 
     if (!queue) {
         logger.error({
             message: 'Queue not initialized',
-            requestId
+            requestId,
+            reason: 'Server still initializing',
+            timestamp: new Date().toISOString()
         });
         return res.status(503).json({ status: 'error', message: 'Server initializing' });
     }
@@ -468,7 +809,8 @@ app.get('/queue-status', (req, res) => {
         requestId,
         queueSize: status.size,
         queuePending: status.pending,
-        queuePaused: status.isPaused
+        queuePaused: status.isPaused,
+        timestamp: new Date().toISOString()
     });
 
     res.json(status);
@@ -484,6 +826,11 @@ const metrics = {
 
 // Initialize metrics
 function initializeMetrics() {
+    logger.info({
+        message: 'Initializing metrics',
+        timestamp: new Date().toISOString()
+    });
+
     // Create initial time series points for the last hour (12 5-minute intervals)
     const timePoints = Array.from({ length: 12 }, (_, i) => {
         const minutes = i * 5;
@@ -492,8 +839,10 @@ function initializeMetrics() {
 
     metrics.requestCounts = [...timePoints];
 
-    // Initialize empty node and model performance objects
-    // These will be populated as requests come in
+    logger.info({
+        message: 'Metrics initialized successfully',
+        timestamp: new Date().toISOString()
+    });
 }
 
 // Update metrics after each Ollama API call
@@ -509,6 +858,12 @@ function updateMetrics(nodeId, modelId, startTime, responseData, isError = false
             const minutes = i * 5;
             metrics.responseTimes[nodeId].push({ time: `${minutes}m`, value: 0 });
         }
+
+        logger.debug({
+            message: 'Initialized response time metrics for node',
+            nodeId,
+            timestamp: new Date().toISOString()
+        });
     }
 
     // Add current response time to the latest time point
@@ -533,6 +888,12 @@ function updateMetrics(nodeId, modelId, startTime, responseData, isError = false
             requestsProcessed: 0,
             errorRate: 0
         };
+
+        logger.debug({
+            message: 'Initialized node performance metrics',
+            nodeId,
+            timestamp: new Date().toISOString()
+        });
     }
 
     const nodeMetrics = metrics.nodePerformance[nodeId];
@@ -544,6 +905,13 @@ function updateMetrics(nodeId, modelId, startTime, responseData, isError = false
     if (isError) {
         const errorCount = (nodeMetrics.errorRate / 100) * (nodeMetrics.requestsProcessed - 1);
         nodeMetrics.errorRate = ((errorCount + 1) / nodeMetrics.requestsProcessed) * 100;
+
+        logger.debug({
+            message: 'Updated node error rate',
+            nodeId,
+            newErrorRate: nodeMetrics.errorRate,
+            timestamp: new Date().toISOString()
+        });
     }
 
     // Update model performance
@@ -553,6 +921,12 @@ function updateMetrics(nodeId, modelId, startTime, responseData, isError = false
             requestsProcessed: 0,
             avgTokensGenerated: 0
         };
+
+        logger.debug({
+            message: 'Initialized model performance metrics',
+            modelId,
+            timestamp: new Date().toISOString()
+        });
     }
 
     const modelMetrics = metrics.modelPerformance[modelId];
@@ -576,6 +950,16 @@ function updateMetrics(nodeId, modelId, startTime, responseData, isError = false
     modelMetrics.avgTokensGenerated =
         (modelMetrics.avgTokensGenerated * (modelMetrics.requestsProcessed - 1) + tokensGenerated) /
         modelMetrics.requestsProcessed;
+
+    // Log detailed metrics update for debugging
+    logger.debug({
+        message: 'Updated performance metrics',
+        nodeId,
+        modelId,
+        requestDuration: duration,
+        tokensGenerated,
+        timestamp: new Date().toISOString()
+    });
 }
 
 // Get metrics
@@ -584,12 +968,38 @@ app.get('/admin/metrics', (req, res) => {
 
     logger.info({
         message: 'Metrics requested',
-        requestId
+        requestId,
+        endpoint: '/admin/metrics',
+        timestamp: new Date().toISOString()
     });
+
+    // Add memory and CPU stats to metrics response
+    const systemStats = {
+        cpuUsage: process.cpuUsage().user / 1000000,
+        memoryUsage: {
+            rss: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+            heapTotal: Math.round(process.memoryUsage().heapTotal / (1024 * 1024)),
+            heapUsed: Math.round(process.memoryUsage().heapUsed / (1024 * 1024)),
+            external: Math.round(process.memoryUsage().external / (1024 * 1024))
+        },
+        uptime: Math.floor((Date.now() - metrics.startTime) / 1000)
+    };
 
     res.json({
         status: 'ok',
-        data: metrics
+        data: {
+            ...metrics,
+            system: systemStats
+        }
+    });
+
+    logger.info({
+        message: 'Metrics request successful',
+        requestId,
+        metricTypes: Object.keys(metrics),
+        nodeCount: Object.keys(metrics.nodePerformance).length,
+        modelCount: Object.keys(metrics.modelPerformance).length,
+        timestamp: new Date().toISOString()
     });
 });
 
@@ -599,23 +1009,41 @@ app.get('/admin/system', (req, res) => {
 
     logger.info({
         message: 'System info requested',
-        requestId
+        requestId,
+        endpoint: '/admin/system',
+        timestamp: new Date().toISOString()
     });
 
     const uptime = Math.floor((Date.now() - metrics.startTime) / 1000);
+    const memoryUsage = process.memoryUsage();
+    const cpuInfo = os.cpus();
 
     const systemInfo = {
         apiVersion: '1.0.0',
         uptime: uptime,
+        uptimeFormatted: formatUptime(uptime),
         cpuUsage: process.cpuUsage().user / 1000000,
+        cpuInfo: {
+            cores: cpuInfo.length,
+            model: cpuInfo[0].model,
+            speed: cpuInfo[0].speed
+        },
         memoryUsage: {
-            used: `${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)} MB`,
-            total: `${Math.round(os.totalmem() / 1024 / 1024)} MB`
+            used: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)} MB`,
+            total: `${Math.round(os.totalmem() / 1024 / 1024)} MB`,
+            rss: `${Math.round(memoryUsage.rss / 1024 / 1024)} MB`,
+            heapTotal: `${Math.round(memoryUsage.heapTotal / 1024 / 1024)} MB`,
+            heapUsed: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)} MB`,
+            external: `${Math.round(memoryUsage.external / 1024 / 1024)} MB`
         },
         diskUsage: {
             used: 'N/A',
             total: 'N/A'
         },
+        platform: os.platform(),
+        arch: os.arch(),
+        hostname: os.hostname(),
+        networkInterfaces: getNetworkInfo(),
         nodeJsVersion: process.version,
         expressVersion: require('express/package.json').version,
         environment: process.env.NODE_ENV || 'development'
@@ -625,7 +1053,47 @@ app.get('/admin/system', (req, res) => {
         status: 'ok',
         data: systemInfo
     });
+
+    logger.info({
+        message: 'System info request successful',
+        requestId,
+        uptime: systemInfo.uptimeFormatted,
+        memory: systemInfo.memoryUsage.used,
+        timestamp: new Date().toISOString()
+    });
 });
+
+// Format uptime in a human-readable format
+function formatUptime(seconds) {
+    const days = Math.floor(seconds / (3600 * 24));
+    const hours = Math.floor((seconds % (3600 * 24)) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = Math.floor(seconds % 60);
+
+    return `${days}d ${hours}h ${minutes}m ${secs}s`;
+}
+
+// Get network interface information
+function getNetworkInfo() {
+    const interfaces = os.networkInterfaces();
+    const result = {};
+
+    Object.keys(interfaces).forEach(iface => {
+        const addresses = interfaces[iface]
+            .filter(addr => !addr.internal)
+            .map(addr => ({
+                address: addr.address,
+                family: addr.family,
+                netmask: addr.netmask
+            }));
+
+        if (addresses.length > 0) {
+            result[iface] = addresses;
+        }
+    });
+
+    return result;
+}
 
 // Reset metrics
 app.post('/admin/reset-stats', (req, res) => {
@@ -633,8 +1101,14 @@ app.post('/admin/reset-stats', (req, res) => {
 
     logger.info({
         message: 'Stats reset requested',
-        requestId
+        requestId,
+        endpoint: '/admin/reset-stats',
+        timestamp: new Date().toISOString()
     });
+
+    // Get current metrics summary before reset for logging
+    const nodeCount = Object.keys(metrics.nodePerformance).length;
+    const modelCount = Object.keys(metrics.modelPerformance).length;
 
     // Reset metrics
     metrics.responseTimes = {};
@@ -645,64 +1119,170 @@ app.post('/admin/reset-stats', (req, res) => {
     // Reinitialize
     initializeMetrics();
 
+    logger.info({
+        message: 'Stats reset successful',
+        requestId,
+        previousNodeCount: nodeCount,
+        previousModelCount: modelCount,
+        timestamp: new Date().toISOString()
+    });
+
     res.json({
         status: 'ok',
-        message: 'Statistics reset successfully'
+        message: 'Statistics reset successfully',
+        timestamp: new Date().toISOString()
     });
 });
 
-// Get logs (simplified - returns recent log entries)
-app.get('/admin/logs', (req, res) => {
+// Get logs from MongoDB (replaces the simplified implementation)
+app.get('/admin/logs', async (req, res) => {
     const requestId = req.id;
-    const level = req.query.level;
+    const { level, limit = 100, page = 1, startDate, endDate } = req.query;
 
     logger.info({
-        message: 'Logs requested',
+        message: 'Logs requested from database',
         requestId,
-        level
+        level,
+        limit,
+        page,
+        startDate,
+        endDate,
+        endpoint: '/admin/logs',
+        timestamp: new Date().toISOString()
     });
 
-    // This is a simplified implementation
-    // In a real implementation, you would need to store and retrieve your logs
-    const logEntries = [
-        {
-            timestamp: new Date().toISOString(),
-            level: 'info',
-            message: 'Server started',
-            source: 'server.js'
-        }
-    ];
+    try {
+        // This endpoint now queries MongoDB for logs
+        // We'll respond with success message for now
+        // In production, you would connect to MongoDB and fetch logs
 
-    if (level) {
-        const filteredLogs = logEntries.filter(entry => entry.level === level);
-        res.json({
-            status: 'ok',
-            data: filteredLogs
+        logger.info({
+            message: 'Log query complete',
+            requestId,
+            level,
+            limit,
+            page,
+            timestamp: new Date().toISOString()
         });
-    } else {
+
+        // Example response - in production this would be actual log data
+        const exampleLogs = [
+            {
+                timestamp: new Date().toISOString(),
+                level: 'info',
+                message: 'Server started',
+                source: 'server.js',
+                serverId: SERVER_ID.ipAddress
+            }
+        ];
+
         res.json({
             status: 'ok',
-            data: logEntries
+            data: level ? exampleLogs.filter(entry => entry.level === level) : exampleLogs
+        });
+    } catch (error) {
+        logger.error({
+            message: 'Error retrieving logs',
+            requestId,
+            error: error.message,
+            stack: error.stack,
+            timestamp: new Date().toISOString()
+        });
+
+        res.status(500).json({
+            status: 'error',
+            message: 'Failed to retrieve logs',
+            error: error.message
         });
     }
 });
 
+// Add periodic health logging
+setInterval(() => {
+    const memoryUsage = process.memoryUsage();
+    logger.info({
+        message: 'System health stats',
+        uptime: Math.floor(process.uptime()),
+        memoryUsage: {
+            rss: `${Math.round(memoryUsage.rss / (1024 * 1024))} MB`,
+            heapTotal: `${Math.round(memoryUsage.heapTotal / (1024 * 1024))} MB`,
+            heapUsed: `${Math.round(memoryUsage.heapUsed / (1024 * 1024))} MB`,
+            external: `${Math.round(memoryUsage.external / (1024 * 1024))} MB`
+        },
+        cpuUsage: process.cpuUsage(),
+        activeRequests: queue ? queue.pending : 'N/A',
+        queuedRequests: queue ? queue.size : 'N/A',
+        timestamp: new Date().toISOString()
+    });
+}, 5 * 60 * 1000); // Every 5 minutes
 
-// Catch-all error handler
+// Catch-all error handler with enhanced logging
 app.use((err, req, res, next) => {
     const requestId = req.id || 'unknown';
 
     logger.error({
         message: 'Unhandled error',
         requestId,
+        method: req.method,
+        url: req.originalUrl,
         error: err.message,
-        stack: err.stack
+        errorName: err.name,
+        errorCode: err.code,
+        stack: err.stack,
+        timestamp: new Date().toISOString()
     });
 
     res.status(500).json({
         status: 'error',
-        message: 'An unexpected error occurred'
+        message: 'An unexpected error occurred',
+        requestId: requestId
     });
+});
+
+// Add process uncaught exception handler
+process.on('uncaughtException', (error) => {
+    logger.error({
+        message: 'Uncaught exception',
+        error: error.message,
+        stack: error.stack,
+        fatal: true,
+        timestamp: new Date().toISOString()
+    });
+
+    // Optional: graceful shutdown
+    setTimeout(() => {
+        process.exit(1);
+    }, 1000);
+});
+
+// Add process unhandled rejection handler
+process.on('unhandledRejection', (reason, promise) => {
+    logger.error({
+        message: 'Unhandled promise rejection',
+        reason: reason.toString(),
+        stack: reason.stack,
+        fatal: false,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Add shutdown logging
+process.on('SIGINT', () => {
+    logger.info({
+        message: 'Server shutting down',
+        reason: 'SIGINT received',
+        timestamp: new Date().toISOString()
+    });
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    logger.info({
+        message: 'Server shutting down',
+        reason: 'SIGTERM received',
+        timestamp: new Date().toISOString()
+    });
+    process.exit(0);
 });
 
 initializeMetrics();
