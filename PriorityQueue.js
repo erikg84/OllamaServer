@@ -121,7 +121,7 @@ class PriorityQueue {
         this.taskIdCounter = 0;
 
         // Processing state
-        this.isPaused = true;
+        this._isPaused = true;
         this.interval = null;
         this.processingPromise = null;
 
@@ -237,13 +237,16 @@ class PriorityQueue {
         const wasPaused = this._isPaused;
         this._isPaused = value;
 
-        if (wasPaused && !value) {
-            // Queue was resumed
-            this.emitEvent('start');
-            this.processNextTasks();
-        } else if (!wasPaused && value) {
-            // Queue was paused
-            this.emitEvent('pause');
+        // Emit events only if listeners exist
+        if (this.listeners) {
+            if (wasPaused && !value) {
+                // Queue was resumed
+                this.emitEvent('start');
+                this.processNextTasks();
+            } else if (!wasPaused && value) {
+                // Queue was paused
+                this.emitEvent('pause');
+            }
         }
     }
 

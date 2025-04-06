@@ -14,6 +14,9 @@ const CacheKeyGenerator = require('./CacheKeyGenerator');
 const CacheMetrics = require('./CacheMetrics');
 const { CircuitBreaker, CircuitOpenError } = require('./CircuitBreaker');
 const PriorityQueue = require('./PriorityQueue');
+const GpuMonitor = require('./GpuMonitor');
+const OllamaHealthMonitor = require('./OllamaHealthMonitor');
+const TimeoutManager = require('./TimeoutManager');
 const createCacheMiddleware = require('./cache-middleware');
 
 // Adaptive concurrency configuration
@@ -204,10 +207,39 @@ const logger = winston.createLogger({
     ]
 });
 
+const TIMEOUT_CONFIG = {
+    defaultTimeoutMs: process.env.DEFAULT_TIMEOUT_MS || 30000, // Default 30 seconds
+    modelTimeouts: {
+        'llama2:70b': 60000,       // 60 seconds
+        'mixtral:8x7b': 45000,     // 45 seconds
+        'codellama': 40000,        // 40 seconds
+        'phi': 20000               // 20 seconds
+        // Add additional model-specific timeouts here
+    },
+    adjustmentInterval: 60000,      // Check and adjust timeouts every minute
+    minTimeoutMs: 10000,            // Minimum allowed timeout: 10 seconds
+    maxTimeoutMs: 120000,           // Maximum allowed timeout: 2 minutes
+    logger: logger
+};
+
+const OLLAMA_HEALTH_MONITOR_CONFIG = {
+    apiUrl: process.env.OLLAMA_API_URL || 'http://127.0.0.1:11434',
+    checkInterval: parseInt(process.env.OLLAMA_HEALTH_CHECK_INTERVAL || '30000'), // 30 seconds
+    timeoutThreshold: parseInt(process.env.OLLAMA_TIMEOUT_THRESHOLD || '10000'), // 10 seconds
+    maxFailedChecks: parseInt(process.env.OLLAMA_MAX_FAILED_CHECKS || '3'),
+    restartCommand: process.env.OLLAMA_RESTART_COMMAND || 'systemctl restart ollama',
+    logger: logger
+};
+
+
 const app = express();
 app.use(express.json({ limit: '50mb' })); // Add limit to prevent large request body issues
 
-let queue;
+let queue = new PriorityQueue({
+    ...PRIORITY_QUEUE_CONFIG,
+    logger: logger,
+    autoStart: true
+});
 
 // Llama API base URL
 const LLAMA_BASE_URL = 'http://127.0.0.1:11434/api';
@@ -224,6 +256,24 @@ logger.info({
     totalMemory: `${Math.round(os.totalmem() / (1024 * 1024))} MB`,
     freeMemory: `${Math.round(os.freemem() / (1024 * 1024))} MB`
 });
+
+const GPU_CONFIG = {
+    sampleInterval: process.env.GPU_SAMPLE_INTERVAL || 5000, // 5 seconds
+    historyLength: process.env.GPU_HISTORY_LENGTH || 100,
+    utilizationHighThreshold: process.env.GPU_UTILIZATION_HIGH || 85,
+    utilizationLowThreshold: process.env.GPU_UTILIZATION_LOW || 30,
+    memoryHighThreshold: process.env.GPU_MEMORY_HIGH || 85,
+    memoryLowThreshold: process.env.GPU_MEMORY_LOW || 40,
+    temperatureHighThreshold: process.env.GPU_TEMP_HIGH || 80,
+    temperatureWarningThreshold: process.env.GPU_TEMP_WARN || 70,
+    modelMemoryRequirements: {
+        default: 2000,   // Default GPU memory requirement (MB)
+        'llama2:70b': 4096,
+        'mixtral:8x7b': 3072,
+        // add other specific model requirements if needed
+    },
+    logger: logger
+};
 
 // Add request ID middleware
 app.use((req, res, next) => {
@@ -358,6 +408,28 @@ function sanitizeRequestBody(body) {
     return sanitized;
 }
 
+function adjustConcurrencyBasedOnGpuMetrics(currentConcurrency) {
+    if (!global.gpuMonitor || !global.gpuMonitor.gpuInfo.detected) {
+        return currentConcurrency; // No GPUs detected; skip GPU-based adjustments
+    }
+
+    const recommendation = global.gpuMonitor.getRecommendedConcurrency('default', currentConcurrency);
+    logger.info({
+        message: 'GPU-based concurrency recommendation',
+        recommendation,
+        timestamp: new Date().toISOString()
+    });
+
+    switch (recommendation.direction) {
+        case 'increase':
+            return Math.min(currentConcurrency + 1, CONCURRENCY_CONFIG.MAX_CONCURRENCY);
+        case 'decrease':
+            return Math.max(currentConcurrency - 1, CONCURRENCY_CONFIG.MIN_CONCURRENCY);
+        default:
+            return currentConcurrency;
+    }
+}
+
 (async () => {
     try {
         logger.info({
@@ -365,11 +437,11 @@ function sanitizeRequestBody(body) {
             timestamp: new Date().toISOString()
         });
 
-        queue = new PriorityQueue({
-            ...PRIORITY_QUEUE_CONFIG,
-            logger: logger,
-            autoStart: true
-        });
+        // queue = new PriorityQueue({
+        //     ...PRIORITY_QUEUE_CONFIG,
+        //     logger: logger,
+        //     autoStart: true
+        // });
 
         // Initialize resource monitor
         const resourceMonitor = new ResourceMonitor({
@@ -397,6 +469,13 @@ function sanitizeRequestBody(body) {
 
         // Start automatic concurrency management
         queueManager.start();
+        queueManager.on('adjustConcurrency', (currentConcurrency) => {
+            const adjustedConcurrency = adjustConcurrencyBasedOnGpuMetrics(currentConcurrency);
+            queueManager.setConcurrency(adjustedConcurrency);
+        });
+
+        const ollamaHealthMonitor = new OllamaHealthMonitor(OLLAMA_HEALTH_MONITOR_CONFIG);
+        ollamaHealthMonitor.start()
 
         // Initialize model performance tracker
         const modelTracker = new ModelPerformanceTracker({
@@ -445,6 +524,12 @@ function sanitizeRequestBody(body) {
             });
         });
 
+        const gpuMonitor = new GpuMonitor(GPU_CONFIG);
+
+        const timeoutManager = new TimeoutManager(TIMEOUT_CONFIG);
+
+        global.timeoutManager = timeoutManager;
+        global.gpuMonitor = gpuMonitor
         global.circuitBreaker = circuitBreaker;
         global.resourceMonitor = resourceMonitor;
         global.queueManager = queueManager;
@@ -457,6 +542,21 @@ function sanitizeRequestBody(body) {
         global.cacheExcludedModels = CACHE_CONFIG.excludedModels;
         global.cacheModelTTL = CACHE_CONFIG.modelTTL;
         global.defaultCacheTTL = CACHE_CONFIG.defaultTTL;
+        global.ollamaHealthMonitor = ollamaHealthMonitor;
+
+        logger.info({
+            message: 'TimeoutManager initialized successfully',
+            defaultTimeoutMs: TIMEOUT_CONFIG.defaultTimeoutMs,
+            modelCount: Object.keys(TIMEOUT_CONFIG.modelTimeouts).length,
+            timestamp: new Date().toISOString()
+        });
+
+        logger.info({
+            message: 'OllamaHealthMonitor initialized successfully',
+            checkInterval: `${OLLAMA_HEALTH_MONITOR_CONFIG.checkInterval}ms`,
+            timeoutThreshold: `${OLLAMA_HEALTH_MONITOR_CONFIG.timeoutThreshold}ms`,
+            timestamp: new Date().toISOString()
+        });
 
         logger.info({
             message: 'Cache initialized successfully',
@@ -494,6 +594,20 @@ function sanitizeRequestBody(body) {
             logger.warn({
                 message: 'Manual garbage collection not available',
                 resolution: 'Run with node --expose-gc for better memory management',
+                timestamp: new Date().toISOString()
+            });
+        }
+
+
+        if (gpuMonitor.gpuInfo.detected) {
+            logger.info({
+                message: 'GpuMonitor initialized successfully',
+                gpuCount: gpuMonitor.gpuInfo.count,
+                timestamp: new Date().toISOString()
+            });
+        } else {
+            logger.warn({
+                message: 'GpuMonitor failed to initialize - no GPUs detected',
                 timestamp: new Date().toISOString()
             });
         }
@@ -556,17 +670,6 @@ function sanitizeRequestBody(body) {
             timestamp: new Date().toISOString()
         });
 
-        // Start the server
-        const PORT = process.env.PORT || 3000;
-        app.listen(PORT, () => {
-            logger.info({
-                message: `Server running on port ${PORT}`,
-                port: PORT,
-                serverUrl: `http://${SERVER_ID.ipAddress}:${PORT}`,
-                timestamp: new Date().toISOString()
-            });
-        });
-
         // Apply cache middleware if enabled
         if (CACHE_CONFIG.enabled) {
             const cacheMiddleware = createCacheMiddleware(
@@ -583,6 +686,17 @@ function sanitizeRequestBody(body) {
                 timestamp: new Date().toISOString()
             });
         }
+
+        // Start the server
+        const PORT = process.env.PORT || 3000;
+        app.listen(PORT, () => {
+            logger.info({
+                message: `Server running on port ${PORT}`,
+                port: PORT,
+                serverUrl: `http://${SERVER_ID.ipAddress}:${PORT}`,
+                timestamp: new Date().toISOString()
+            });
+        });
     } catch (error) {
         logger.error({
             message: 'Failed to initialize server',
@@ -593,6 +707,48 @@ function sanitizeRequestBody(body) {
         process.exit(1);
     }
 })();
+
+setInterval(() => {
+    if (global.gpuMonitor && global.gpuMonitor.gpuInfo.detected) {
+        const currentMetrics = global.gpuMonitor.getCurrentMetrics();
+        logger.info({
+            message: 'Periodic GPU metrics snapshot',
+            metrics: currentMetrics,
+            timestamp: new Date().toISOString()
+        });
+    }
+}, 60000);
+
+app.get('/admin/gpu', (req, res) => {
+    const requestId = req.id;
+
+    logger.info({
+        message: 'GPU metrics requested',
+        requestId,
+        endpoint: '/admin/gpu',
+        timestamp: new Date().toISOString()
+    });
+
+    if (!global.gpuMonitor || !global.gpuMonitor.gpuInfo.detected) {
+        return res.status(503).json({
+            status: 'error',
+            message: 'GpuMonitor not initialized or no GPUs detected'
+        });
+    }
+
+    const gpuStatus = global.gpuMonitor.getStatus();
+    const currentMetrics = global.gpuMonitor.getCurrentMetrics();
+    const averageMetrics = global.gpuMonitor.getAverageMetrics(5);
+
+    res.json({
+        status: 'ok',
+        data: {
+            gpuStatus,
+            currentMetrics,
+            averageMetrics
+        }
+    });
+});
 
 // Concurrency management endpoint
 app.get('/admin/concurrency', (req, res) => {
@@ -687,6 +843,10 @@ app.post('/admin/concurrency', (req, res) => {
         } else if (action === 'auto') {
             // Resume automatic concurrency management
             global.queueManager.start();
+            queueManager.on('adjustConcurrency', (currentConcurrency) => {
+                const adjustedConcurrency = adjustConcurrencyBasedOnGpuMetrics(currentConcurrency);
+                queueManager.setConcurrency(adjustedConcurrency);
+            });
 
             logger.info({
                 message: 'Automatic concurrency management resumed',
@@ -1036,252 +1196,174 @@ app.post('/admin/cache/config', (req, res) => {
     }
 });
 
-// Generation endpoint with queuing
+// Timeout logic integrated for /chat endpoint
+app.post('/chat', async (req, res) => {
+    const requestId = req.id;
+    const startTime = Date.now();
+    const node = req.body.node || 'unknown';
+    const model = req.body.model || 'unknown';
+    const timeoutMs = global.timeoutManager.getTimeoutForModel(model);
+
+    logger.info({
+        message: 'Chat request received',
+        requestId,
+        model,
+        node,
+        timeoutMs,
+        timestamp: new Date().toISOString()
+    });
+
+    if (!queue) {
+        return res.status(503).json({ status: 'error', message: 'Server initializing' });
+    }
+
+    let timeoutHandle;
+    let timedOut = false;
+
+    const timeoutPromise = new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+            timedOut = true;
+            global.timeoutManager.recordTimeout(model);
+            reject(new Error('Request timed out'));
+        }, timeoutMs);
+    });
+
+    const queuePromise = queue.add(async () => {
+        const response = await axios.post(`${LLAMA_BASE_URL}/chat`, req.body);
+        return response;
+    });
+
+    try {
+        const result = await Promise.race([queuePromise, timeoutPromise]);
+        clearTimeout(timeoutHandle);
+        global.timeoutManager.recordSuccess(model);
+
+        logger.info({
+            message: 'Chat request successful',
+            requestId,
+            duration: `${Date.now() - startTime}ms`,
+            timestamp: new Date().toISOString()
+        });
+
+        res.json({
+            status: 'ok',
+            timedOut: false,
+            data: result.data
+        });
+    } catch (error) {
+        clearTimeout(timeoutHandle);
+
+        if (timedOut) {
+            logger.warn({
+                message: 'Chat request timed out',
+                requestId,
+                model,
+                timeoutMs,
+                timestamp: new Date().toISOString()
+            });
+
+            return res.status(504).json({
+                status: 'error',
+                message: 'Request timed out',
+                timeoutMs
+            });
+        }
+
+        logger.error({
+            message: 'Chat request failed',
+            requestId,
+            error: error.message,
+            timestamp: new Date().toISOString()
+        });
+
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// Timeout logic integrated for /generate endpoint
 app.post('/generate', async (req, res) => {
     const requestId = req.id;
     const startTime = Date.now();
     const node = req.body.node || 'unknown';
     const model = req.body.model || 'unknown';
+    const timeoutMs = global.timeoutManager.getTimeoutForModel(model);
 
-    const priorityName = req.body.priority || 'NORMAL';
-    let priority = PriorityQueue.Priority.NORMAL; // Default
-
-    // Map string priority to numeric value
-    if (typeof priorityName === 'string') {
-        switch (priorityName.toUpperCase()) {
-            case 'CRITICAL':
-                priority = PriorityQueue.Priority.CRITICAL;
-                break;
-            case 'HIGH':
-                priority = PriorityQueue.Priority.HIGH;
-                break;
-            case 'NORMAL':
-                priority = PriorityQueue.Priority.NORMAL;
-                break;
-            case 'LOW':
-                priority = PriorityQueue.Priority.LOW;
-                break;
-            case 'BACKGROUND':
-                priority = PriorityQueue.Priority.BACKGROUND;
-                break;
-        }
-    }
-
-    // Enhanced generate request logging
     logger.info({
         message: 'Generate request received',
         requestId,
         model,
         node,
-        priority: PriorityQueue.getPriorityName(priority),
-        promptLength: req.body.prompt ? req.body.prompt.length : 'undefined',
-        options: req.body.options || {},
-        resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
+        timeoutMs,
         timestamp: new Date().toISOString()
     });
 
     if (!queue) {
-        logger.error({
-            message: 'Queue not initialized',
-            requestId,
-            reason: 'Server still initializing',
-            timestamp: new Date().toISOString()
-        });
         return res.status(503).json({ status: 'error', message: 'Server initializing' });
     }
 
+    let timeoutHandle;
+    let timedOut = false;
+
+    const timeoutPromise = new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+            timedOut = true;
+            global.timeoutManager.recordTimeout(model);
+            reject(new Error('Request timed out'));
+        }, timeoutMs);
+    });
+
+    const queuePromise = queue.add(async () => {
+        const response = await axios.post(`${LLAMA_BASE_URL}/generate`, req.body);
+        return response;
+    });
+
     try {
-        if (global.circuitBreaker) {
-            try {
-                // Verify if circuit is closed or if we can allow this request
-                await global.circuitBreaker.execute(
-                    () => Promise.resolve(),
-                    { modelId: model }
-                );
-            } catch (error) {
-                if (error instanceof CircuitOpenError) {
-                    logger.warn({
-                        message: 'Generate request rejected by circuit breaker',
-                        requestId,
-                        model,
-                        node,
-                        circuitState: global.circuitBreaker.getModelState(model),
-                        nextAttemptTime: error.details.nextAttemptTime ?
-                            new Date(error.details.nextAttemptTime).toISOString() : 'unknown',
-                        timestamp: new Date().toISOString()
-                    });
-
-                    return res.status(503).json({
-                        status: 'error',
-                        message: 'Service temporarily unavailable',
-                        reason: 'circuit_open',
-                        details: {
-                            nextAttemptTime: error.details.nextAttemptTime ?
-                                new Date(error.details.nextAttemptTime).toISOString() : null
-                        }
-                    });
-                }
-                // For other errors, continue with the request
-            }
-        }
-        // Track this request in the model performance tracker
-        global.modelTracker.trackRequest(requestId, model, {
-            promptTokens: req.body.prompt ? estimateTokenCount(req.body.prompt) : 0,
-            concurrentRequests: queue.pending,
-            node
-        });
-
-        logger.info({
-            message: 'Adding generate request to queue',
-            requestId,
-            model,
-            priority: PriorityQueue.getPriorityName(priority),
-            queueSize: queue.size,
-            queuePending: queue.pending,
-            timestamp: new Date().toISOString()
-        });
-
-        const queueStartTime = Date.now();
-        const result = await queue.add(async () => {
-            const queueWaitTime = Date.now() - queueStartTime;
-
-            logger.info({
-                message: 'Executing generate request',
-                requestId,
-                model,
-                node,
-                queueWaitTime: `${queueWaitTime}ms`,
-                startTime: new Date(startTime).toISOString(),
-                timestamp: new Date().toISOString()
-            });
-
-            try {
-                // Use circuit breaker to wrap API call
-                return await global.circuitBreaker.execute(async () => {
-                    // Log API call attempt
-                    logger.info({
-                        message: 'Making generate API call',
-                        requestId,
-                        endpoint: `${LLAMA_BASE_URL}/generate`,
-                        method: 'POST',
-                        model,
-                        timestamp: new Date().toISOString()
-                    });
-
-                    const response = await axios.post(`${LLAMA_BASE_URL}/generate`, req.body);
-
-                    // Extract metrics from response for logging
-                    const tokenCount = response.data.eval_count || 0;
-                    const promptTokens = response.data.prompt_eval_count || 0;
-                    const duration = Date.now() - startTime;
-                    const tokensPerSecond = tokenCount > 0 ? (tokenCount / (duration / 1000)).toFixed(2) : 0;
-
-                    // Track request completion in the model performance tracker
-                    global.modelTracker.trackRequestCompletion(requestId, {
-                        tokenCount,
-                        promptTokens,
-                        duration
-                    });
-
-                    updateMetrics(node, model, startTime, response.data);
-
-                    // Enhanced successful API call logging
-                    logger.info({
-                        message: 'Generate API call successful',
-                        requestId,
-                        model,
-                        node,
-                        duration: `${duration}ms`,
-                        responseSize: JSON.stringify(response.data).length,
-                        tokenCount,
-                        promptTokens,
-                        totalTokens: promptTokens + tokenCount,
-                        tokensPerSecond: `${tokensPerSecond} tokens/sec`,
-                        resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
-                        timestamp: new Date().toISOString()
-                    });
-                    return response;
-                }, { modelId: model }, { priority: priority } );
-            } catch (error) {
-                // Check if this is a circuit open error
-                if (error instanceof CircuitOpenError) {
-                    logger.warn({
-                        message: 'Generate API call rejected by circuit breaker',
-                        requestId,
-                        model,
-                        node,
-                        circuitState: global.circuitBreaker.getModelState(model),
-                        timestamp: new Date().toISOString()
-                    });
-
-                    throw {
-                        status: 503,
-                        message: 'Service temporarily unavailable',
-                        reason: 'circuit_open',
-                        details: error.details
-                    };
-                }
-
-                global.modelTracker.trackRequestCompletion(requestId, {}, true);
-                updateMetrics(node, model, startTime, null, true);
-                logger.error({
-                    message: 'Generate API call failed',
-                    requestId,
-                    model,
-                    node,
-                    error: error.message,
-                    errorCode: error.code,
-                    errorResponse: error.response ? {
-                        status: error.response.status,
-                        statusText: error.response.statusText,
-                        data: error.response.data
-                    } : 'No response',
-                    duration: `${Date.now() - startTime}ms`,
-                    timestamp: new Date().toISOString()
-                });
-                throw error;
-            }
-        });
+        const result = await Promise.race([queuePromise, timeoutPromise]);
+        clearTimeout(timeoutHandle);
+        global.timeoutManager.recordSuccess(model);
 
         logger.info({
             message: 'Generate request successful',
             requestId,
-            model,
-            node,
             duration: `${Date.now() - startTime}ms`,
             timestamp: new Date().toISOString()
         });
-        if (global.memoryManager && req.memoryTracking) {
-            global.memoryManager.releaseRequestMemory(requestId);
-        }
-        res.json(result.data);
+
+        res.json({
+            status: 'ok',
+            timedOut: false,
+            data: result.data
+        });
     } catch (error) {
-        // Handle custom error format for circuit breaker
-        if (error.status === 503 && error.reason === 'circuit_open') {
-            return res.status(503).json({
+        clearTimeout(timeoutHandle);
+
+        if (timedOut) {
+            logger.warn({
+                message: 'Generate request timed out',
+                requestId,
+                model,
+                timeoutMs,
+                timestamp: new Date().toISOString()
+            });
+
+            return res.status(504).json({
                 status: 'error',
-                message: error.message,
-                reason: error.reason,
-                details: error.details
+                message: 'Request timed out',
+                timeoutMs
             });
         }
 
         logger.error({
             message: 'Generate request failed',
             requestId,
-            model,
-            node,
             error: error.message,
-            stack: error.stack,
-            duration: `${Date.now() - startTime}ms`,
             timestamp: new Date().toISOString()
         });
-        if (global.memoryManager && req.memoryTracking) {
-            global.memoryManager.releaseRequestMemory(requestId);
-        }
+
         res.status(500).json({ status: 'error', message: error.message });
     }
 });
+
 
 app.get('/admin/queue', (req, res) => {
     const requestId = req.id;
@@ -1423,7 +1505,6 @@ app.post('/admin/queue', (req, res) => {
     }
 });
 
-// Update /queue-status endpoint to return more detailed info
 app.get('/queue-status', (req, res) => {
     const requestId = req.id;
 
@@ -1588,171 +1669,6 @@ app.post('/admin/circuit', (req, res) => {
             status: 'error',
             message: error.message
         });
-    }
-});
-
-// Chat endpoint with queuing
-app.post('/chat', async (req, res) => {
-    const requestId = req.id;
-    const startTime = Date.now();
-    const node = req.body.node || 'unknown';
-    const model = req.body.model || 'unknown';
-
-    // Enhanced chat request logging
-    logger.info({
-        message: 'Chat request received',
-        requestId,
-        model,
-        node,
-        messagesCount: req.body.messages ? req.body.messages.length : 'undefined',
-        options: req.body.options || {},
-        systemPromptLength: req.body.system ? req.body.system.length : 0,
-        resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
-        timestamp: new Date().toISOString()
-    });
-
-    if (!queue) {
-        logger.error({
-            message: 'Queue not initialized',
-            requestId,
-            reason: 'Server still initializing',
-            timestamp: new Date().toISOString()
-        });
-        return res.status(503).json({ status: 'error', message: 'Server initializing' });
-    }
-
-    try {
-        // Track this request in the model performance tracker
-        global.modelTracker.trackRequest(requestId, model, {
-            promptTokens: estimateChatTokens(req.body.messages, req.body.system),
-            concurrentRequests: queue.pending,
-            node
-        });
-
-        logger.info({
-            message: 'Adding chat request to queue',
-            requestId,
-            model,
-            queueSize: queue.size,
-            queuePending: queue.pending,
-            currentConcurrency: queue.concurrency,
-            timestamp: new Date().toISOString()
-        });
-
-        const queueStartTime = Date.now();
-        const result = await queue.add(async () => {
-            const queueWaitTime = Date.now() - queueStartTime;
-
-            logger.info({
-                message: 'Executing chat request',
-                requestId,
-                model,
-                node,
-                queueWaitTime: `${queueWaitTime}ms`,
-                startTime: new Date(startTime).toISOString(),
-                resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
-                timestamp: new Date().toISOString()
-            });
-
-            try {
-                // Log API call attempt
-                logger.info({
-                    message: 'Making chat API call',
-                    requestId,
-                    endpoint: `${LLAMA_BASE_URL}/chat`,
-                    method: 'POST',
-                    model,
-                    timestamp: new Date().toISOString()
-                });
-
-                const response = await axios.post(`${LLAMA_BASE_URL}/chat`, req.body);
-
-                // Extract usage metrics for enhanced logging
-                const usage = response.data.usage || {};
-                const inputTokens = usage.prompt_tokens || 0;
-                const outputTokens = usage.completion_tokens || 0;
-                const totalTokens = usage.total_tokens || inputTokens + outputTokens;
-                const duration = Date.now() - startTime;
-                const tokensPerSecond = outputTokens > 0 ? (outputTokens / (duration / 1000)).toFixed(2) : 0;
-
-                // Track request completion in the model performance tracker
-                global.modelTracker.trackRequestCompletion(requestId, {
-                    completionTokens: outputTokens,
-                    promptTokens: inputTokens,
-                    duration
-                });
-
-                updateMetrics(node, model, startTime, response.data);
-
-                // Enhanced successful API call logging
-                logger.info({
-                    message: 'Chat API call successful',
-                    requestId,
-                    model,
-                    node,
-                    duration: `${duration}ms`,
-                    responseSize: JSON.stringify(response.data).length,
-                    promptTokens: inputTokens,
-                    completionTokens: outputTokens,
-                    totalTokens,
-                    tokensPerSecond: `${tokensPerSecond} tokens/sec`,
-                    resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
-                    timestamp: new Date().toISOString()
-                });
-                if (global.memoryManager && req.memoryTracking) {
-                    global.memoryManager.releaseRequestMemory(requestId);
-                }
-                return response;
-            } catch (error) {
-                // Track error in the model performance tracker
-                global.modelTracker.trackRequestCompletion(requestId, {}, true);
-                // Enhanced error logging for API call failures
-                updateMetrics(node, model, startTime, null, true);
-                logger.error({
-                    message: 'Chat API call failed',
-                    requestId,
-                    model,
-                    node,
-                    error: error.message,
-                    errorCode: error.code,
-                    errorResponse: error.response ? {
-                        status: error.response.status,
-                        statusText: error.response.statusText,
-                        data: error.response.data
-                    } : 'No response',
-                    duration: `${Date.now() - startTime}ms`,
-                    resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
-                    timestamp: new Date().toISOString()
-                });
-                throw error;
-            }
-        });
-
-        logger.info({
-            message: 'Chat request successful',
-            requestId,
-            model,
-            node,
-            duration: `${Date.now() - startTime}ms`,
-            timestamp: new Date().toISOString()
-        });
-
-        res.json(result.data);
-    } catch (error) {
-        logger.error({
-            message: 'Chat request failed',
-            requestId,
-            model,
-            node,
-            error: error.message,
-            stack: error.stack,
-            duration: `${Date.now() - startTime}ms`,
-            timestamp: new Date().toISOString()
-        });
-        if (global.memoryManager && req.memoryTracking) {
-            global.memoryManager.releaseRequestMemory(requestId);
-        }
-        res.status(500).json({ status: 'error', message: error.message });
     }
 });
 
@@ -2122,45 +2038,6 @@ app.post('/admin/memory/gc', (req, res) => {
     }
 });
 
-// Queue status endpoint (optional but helpful)
-app.get('/queue-status', (req, res) => {
-    const requestId = req.id;
-
-    logger.info({
-        message: 'Queue status requested',
-        requestId,
-        endpoint: '/queue-status',
-        timestamp: new Date().toISOString()
-    });
-
-    if (!queue) {
-        logger.error({
-            message: 'Queue not initialized',
-            requestId,
-            reason: 'Server still initializing',
-            timestamp: new Date().toISOString()
-        });
-        return res.status(503).json({ status: 'error', message: 'Server initializing' });
-    }
-
-    const status = {
-        size: queue.size,
-        pending: queue.pending,
-        isPaused: queue.isPaused
-    };
-
-    logger.info({
-        message: 'Queue status request successful',
-        requestId,
-        queueSize: status.size,
-        queuePending: status.pending,
-        queuePaused: status.isPaused,
-        timestamp: new Date().toISOString()
-    });
-
-    res.json(status);
-});
-
 const metrics = {
     startTime: Date.now(),
     responseTimes: {},
@@ -2169,7 +2046,6 @@ const metrics = {
     modelPerformance: {}
 };
 
-// Initialize metrics
 function initializeMetrics() {
     logger.info({
         message: 'Initializing metrics',
@@ -2729,6 +2605,15 @@ process.on('SIGINT', () => {
             timestamp: new Date().toISOString()
         });
     }
+
+    if (global.ollamaHealthMonitor) {
+        global.ollamaHealthMonitor.stop();
+        logger.info({
+            message: 'OllamaHealthMonitor stopped',
+            timestamp: new Date().toISOString()
+        });
+    }
+
     process.exit(0);
 });
 
@@ -2778,6 +2663,14 @@ process.on('SIGTERM', () => {
             timestamp: new Date().toISOString()
         });
     }
+    if (global.ollamaHealthMonitor) {
+        global.ollamaHealthMonitor.stop();
+        logger.info({
+            message: 'OllamaHealthMonitor stopped',
+            timestamp: new Date().toISOString()
+        });
+    }
+
     process.exit(0);
 });
 

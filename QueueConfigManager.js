@@ -1,10 +1,13 @@
+const EventEmitter = require('events');
+
+
 /**
  * QueueConfigManager - Manages queue concurrency based on system resources
  *
  * This class uses ResourceMonitor data to dynamically adjust queue concurrency
  * settings based on system load and historical performance.
  */
-class QueueConfigManager {
+class QueueConfigManager extends EventEmitter {
     /**
      * Constructor for QueueConfigManager
      * @param {Object} queue - The p-queue instance to manage
@@ -12,6 +15,7 @@ class QueueConfigManager {
      * @param {Object} config - Configuration options
      */
     constructor(queue, resourceMonitor, config = {}) {
+        super();
         // Store references to managed components
         this.queue = queue;
         this.resourceMonitor = resourceMonitor;
@@ -279,6 +283,8 @@ class QueueConfigManager {
         if (now - this.lastAdjustmentTime < this.config.adjustmentCooldown) {
             return;
         }
+
+        this.emit('adjustConcurrency', this.currentConcurrency);
 
         // Get resource-based recommendation
         const recommendation = this.resourceMonitor.getRecommendedAdjustment(this.currentConcurrency);

@@ -10,6 +10,14 @@ class MemoryManager {
      * @param {Object} config - Configuration options
      */
     constructor(config = {}) {
+        // Ensure logger is always available (fallback to console if not provided)
+        this.logger = config.logger || {
+            info: console.info.bind(console),
+            warn: console.warn.bind(console),
+            error: console.error.bind(console),
+            debug: console.debug.bind(console)
+        };
+
         // Configuration with defaults
         this.config = {
             // Memory thresholds (percentage of total system memory)
@@ -70,9 +78,6 @@ class MemoryManager {
 
         // Get initial system memory values
         this.updateSystemMemory();
-
-        // Required for logging
-        this.logger = config.logger || console;
 
         // Bind methods to maintain 'this' context
         this.updateSystemMemory = this.updateSystemMemory.bind(this);
