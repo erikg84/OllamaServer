@@ -5,6 +5,28 @@ require('winston-mongodb');
 const os = require('os');
 const { v4: uuidv4 } = require('uuid');
 const ip = require('ip');
+const ResourceMonitor = require('./ResourceMonitor');
+const QueueConfigManager = require('./QueueConfigManager');
+const ModelPerformanceTracker = require('./ModelPerformanceTracker');
+
+// Adaptive concurrency configuration
+const CONCURRENCY_CONFIG = {
+    // Concurrency settings
+    MIN_CONCURRENCY: process.env.MIN_CONCURRENCY || 1,
+    MAX_CONCURRENCY: process.env.MAX_CONCURRENCY || 10,
+    DEFAULT_CONCURRENCY: process.env.DEFAULT_CONCURRENCY || 5,
+
+    // Resource thresholds
+    CPU_HIGH_THRESHOLD: process.env.CPU_HIGH_THRESHOLD || 80,
+    CPU_LOW_THRESHOLD: process.env.CPU_LOW_THRESHOLD || 40,
+    MEMORY_HIGH_THRESHOLD: process.env.MEMORY_HIGH_THRESHOLD || 85,
+    MEMORY_LOW_THRESHOLD: process.env.MEMORY_LOW_THRESHOLD || 50,
+
+    // Adjustment parameters
+    ADJUSTMENT_INTERVAL: process.env.ADJUSTMENT_INTERVAL || 30000, // 30 seconds
+    ADJUSTMENT_COOLDOWN: process.env.ADJUSTMENT_COOLDOWN || 10000, // 10 seconds
+    ADJUSTMENT_STEP: process.env.ADJUSTMENT_STEP || 1
+};
 
 // Get server identity information
 const SERVER_ID = {
@@ -68,7 +90,7 @@ app.use(express.json({ limit: '50mb' })); // Add limit to prevent large request 
 let queue;
 
 // Llama API base URL
-const LLAMA_BASE_URL = 'http://localhost:11434/api';
+const LLAMA_BASE_URL = 'http://127.0.0.1:11434/api';
 
 // Log application startup
 logger.info({
@@ -138,6 +160,44 @@ app.use((req, res, next) => {
     next();
 });
 
+/**
+ * Estimate token count for a text prompt
+ * This is a simple approximation - in production use a proper tokenizer
+ * @param {string} text - Text to estimate tokens for
+ * @returns {number} Estimated token count
+ */
+function estimateTokenCount(text) {
+    if (!text) return 0;
+    // Rough approximation - 4 characters per token on average
+    return Math.ceil(text.length / 4);
+}
+
+/**
+ * Estimate token count for chat messages
+ * @param {Array} messages - Chat messages array
+ * @param {string} system - Optional system prompt
+ * @returns {number} Estimated token count
+ */
+function estimateChatTokens(messages, system) {
+    let count = 0;
+
+    // Count system prompt tokens
+    if (system) {
+        count += estimateTokenCount(system);
+    }
+
+    // Count message tokens
+    if (Array.isArray(messages)) {
+        for (const message of messages) {
+            if (message.content) {
+                count += estimateTokenCount(message.content);
+            }
+        }
+    }
+
+    return count;
+}
+
 // Sanitize request body to avoid logging sensitive information
 function sanitizeRequestBody(body) {
     if (!body) return {};
@@ -184,9 +244,46 @@ function sanitizeRequestBody(body) {
 
         const PQueue = (await import('p-queue')).default;
         queue = new PQueue({
-            concurrency: 5,
+            concurrency: CONCURRENCY_CONFIG.DEFAULT_CONCURRENCY,
             autoStart: true
         });
+
+        // Initialize resource monitor
+        const resourceMonitor = new ResourceMonitor({
+            sampleInterval: 5000, // 5 seconds
+            cpuHighThreshold: CONCURRENCY_CONFIG.CPU_HIGH_THRESHOLD,
+            cpuLowThreshold: CONCURRENCY_CONFIG.CPU_LOW_THRESHOLD,
+            memoryHighThreshold: CONCURRENCY_CONFIG.MEMORY_HIGH_THRESHOLD,
+            memoryLowThreshold: CONCURRENCY_CONFIG.MEMORY_LOW_THRESHOLD,
+            logger: logger
+        });
+
+        // Start resource monitoring
+        resourceMonitor.start();
+
+        // Initialize queue config manager
+        const queueManager = new QueueConfigManager(queue, resourceMonitor, {
+            minConcurrency: CONCURRENCY_CONFIG.MIN_CONCURRENCY,
+            maxConcurrency: CONCURRENCY_CONFIG.MAX_CONCURRENCY,
+            defaultConcurrency: CONCURRENCY_CONFIG.DEFAULT_CONCURRENCY,
+            adjustmentStep: CONCURRENCY_CONFIG.ADJUSTMENT_STEP,
+            adjustmentInterval: CONCURRENCY_CONFIG.ADJUSTMENT_INTERVAL,
+            adjustmentCooldown: CONCURRENCY_CONFIG.ADJUSTMENT_COOLDOWN,
+            logger: logger
+        });
+
+        // Start automatic concurrency management
+        queueManager.start();
+
+        // Initialize model performance tracker
+        const modelTracker = new ModelPerformanceTracker({
+            logger: logger
+        });
+
+        // Store instances for global access
+        global.resourceMonitor = resourceMonitor;
+        global.queueManager = queueManager;
+        global.modelTracker = modelTracker;
 
         // Add queue logging
         queue.on('add', () => {
@@ -194,6 +291,7 @@ function sanitizeRequestBody(body) {
                 message: 'Task added to queue',
                 queueSize: queue.size,
                 queuePending: queue.pending,
+                currentConcurrency: queue.concurrency,
                 timestamp: new Date().toISOString()
             });
         });
@@ -203,6 +301,7 @@ function sanitizeRequestBody(body) {
                 message: 'Starting next task',
                 queueSize: queue.size,
                 queuePending: queue.pending,
+                currentConcurrency: queue.concurrency,
                 timestamp: new Date().toISOString()
             });
         });
@@ -212,6 +311,7 @@ function sanitizeRequestBody(body) {
                 message: 'Task completed',
                 queueSize: queue.size,
                 queuePending: queue.pending,
+                currentConcurrency: queue.concurrency,
                 timestamp: new Date().toISOString()
             });
         });
@@ -223,13 +323,15 @@ function sanitizeRequestBody(body) {
                 stack: error.stack,
                 queueSize: queue.size,
                 queuePending: queue.pending,
+                currentConcurrency: queue.concurrency,
                 timestamp: new Date().toISOString()
             });
         });
 
         logger.info({
             message: 'Queue initialized successfully',
-            concurrency: 5,
+            initialConcurrency: queue.concurrency,
+            adaptiveConcurrency: true,
             timestamp: new Date().toISOString()
         });
 
@@ -253,6 +355,146 @@ function sanitizeRequestBody(body) {
         process.exit(1);
     }
 })();
+
+// Concurrency management endpoint
+app.get('/admin/concurrency', (req, res) => {
+    const requestId = req.id;
+
+    logger.info({
+        message: 'Concurrency settings requested',
+        requestId,
+        endpoint: '/admin/concurrency',
+        timestamp: new Date().toISOString()
+    });
+
+    if (!global.queueManager) {
+        return res.status(503).json({
+            status: 'error',
+            message: 'Concurrency manager not initialized'
+        });
+    }
+
+    // Get current concurrency status
+    const status = global.queueManager.getStatus();
+    const resourceMetrics = global.resourceMonitor.getCurrentMetrics();
+
+    res.json({
+        status: 'ok',
+        data: {
+            currentSettings: {
+                concurrency: status.currentConcurrency,
+                ...status.config
+            },
+            resourceUsage: resourceMetrics,
+            queueStatus: {
+                size: queue.size,
+                pending: queue.pending,
+                isPaused: queue.isPaused
+            },
+            performanceStats: status.stats,
+            lastAdjustment: status.lastAdjustment
+        }
+    });
+
+    logger.info({
+        message: 'Concurrency settings request successful',
+        requestId,
+        currentConcurrency: status.currentConcurrency,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Concurrency configuration endpoint
+app.post('/admin/concurrency', (req, res) => {
+    const requestId = req.id;
+
+    logger.info({
+        message: 'Concurrency settings update requested',
+        requestId,
+        endpoint: '/admin/concurrency',
+        requestBody: req.body,
+        timestamp: new Date().toISOString()
+    });
+
+    if (!global.queueManager) {
+        return res.status(503).json({
+            status: 'error',
+            message: 'Concurrency manager not initialized'
+        });
+    }
+
+    try {
+        const { action, concurrency, duration } = req.body;
+
+        if (action === 'force' && concurrency !== undefined) {
+            // Force a specific concurrency level
+            global.queueManager.forceSetConcurrency(
+                parseInt(concurrency, 10),
+                duration ? parseInt(duration, 10) : 0
+            );
+
+            logger.info({
+                message: 'Concurrency manually set',
+                requestId,
+                newConcurrency: concurrency,
+                duration: duration || 'indefinite',
+                timestamp: new Date().toISOString()
+            });
+
+            return res.json({
+                status: 'ok',
+                message: `Concurrency set to ${concurrency}`,
+                duration: duration ? `${duration}ms` : 'indefinite'
+            });
+        } else if (action === 'auto') {
+            // Resume automatic concurrency management
+            global.queueManager.start();
+
+            logger.info({
+                message: 'Automatic concurrency management resumed',
+                requestId,
+                timestamp: new Date().toISOString()
+            });
+
+            return res.json({
+                status: 'ok',
+                message: 'Automatic concurrency management resumed'
+            });
+        } else if (action === 'pause') {
+            // Pause automatic concurrency management
+            global.queueManager.stop();
+
+            logger.info({
+                message: 'Automatic concurrency management paused',
+                requestId,
+                timestamp: new Date().toISOString()
+            });
+
+            return res.json({
+                status: 'ok',
+                message: 'Automatic concurrency management paused'
+            });
+        }
+
+        return res.status(400).json({
+            status: 'error',
+            message: 'Invalid action. Use "force", "auto", or "pause"'
+        });
+    } catch (error) {
+        logger.error({
+            message: 'Error updating concurrency settings',
+            requestId,
+            error: error.message,
+            stack: error.stack,
+            timestamp: new Date().toISOString()
+        });
+
+        return res.status(500).json({
+            status: 'error',
+            message: error.message
+        });
+    }
+});
 
 // Health check endpoint
 app.get('/health', async (req, res) => {
@@ -371,6 +613,7 @@ app.post('/generate', async (req, res) => {
         node,
         promptLength: req.body.prompt ? req.body.prompt.length : 'undefined',
         options: req.body.options || {},
+        resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
         timestamp: new Date().toISOString()
     });
 
@@ -385,6 +628,13 @@ app.post('/generate', async (req, res) => {
     }
 
     try {
+        // Track this request in the model performance tracker
+        global.modelTracker.trackRequest(requestId, model, {
+            promptTokens: req.body.prompt ? estimateTokenCount(req.body.prompt) : 0,
+            concurrentRequests: queue.pending,
+            node
+        });
+
         logger.info({
             message: 'Adding generate request to queue',
             requestId,
@@ -427,6 +677,13 @@ app.post('/generate', async (req, res) => {
                 const duration = Date.now() - startTime;
                 const tokensPerSecond = tokenCount > 0 ? (tokenCount / (duration / 1000)).toFixed(2) : 0;
 
+                // Track request completion in the model performance tracker
+                global.modelTracker.trackRequestCompletion(requestId, {
+                    tokenCount,
+                    promptTokens,
+                    duration
+                });
+
                 updateMetrics(node, model, startTime, response.data);
 
                 // Enhanced successful API call logging
@@ -441,11 +698,12 @@ app.post('/generate', async (req, res) => {
                     promptTokens,
                     totalTokens: promptTokens + tokenCount,
                     tokensPerSecond: `${tokensPerSecond} tokens/sec`,
+                    resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
                     timestamp: new Date().toISOString()
                 });
                 return response;
             } catch (error) {
-                // Enhanced error logging for API call failures
+                global.modelTracker.trackRequestCompletion(requestId, {}, true);
                 updateMetrics(node, model, startTime, null, true);
                 logger.error({
                     message: 'Generate API call failed',
@@ -508,6 +766,7 @@ app.post('/chat', async (req, res) => {
         messagesCount: req.body.messages ? req.body.messages.length : 'undefined',
         options: req.body.options || {},
         systemPromptLength: req.body.system ? req.body.system.length : 0,
+        resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
         timestamp: new Date().toISOString()
     });
 
@@ -522,12 +781,20 @@ app.post('/chat', async (req, res) => {
     }
 
     try {
+        // Track this request in the model performance tracker
+        global.modelTracker.trackRequest(requestId, model, {
+            promptTokens: estimateChatTokens(req.body.messages, req.body.system),
+            concurrentRequests: queue.pending,
+            node
+        });
+
         logger.info({
             message: 'Adding chat request to queue',
             requestId,
             model,
             queueSize: queue.size,
             queuePending: queue.pending,
+            currentConcurrency: queue.concurrency,
             timestamp: new Date().toISOString()
         });
 
@@ -542,6 +809,7 @@ app.post('/chat', async (req, res) => {
                 node,
                 queueWaitTime: `${queueWaitTime}ms`,
                 startTime: new Date(startTime).toISOString(),
+                resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
                 timestamp: new Date().toISOString()
             });
 
@@ -566,6 +834,13 @@ app.post('/chat', async (req, res) => {
                 const duration = Date.now() - startTime;
                 const tokensPerSecond = outputTokens > 0 ? (outputTokens / (duration / 1000)).toFixed(2) : 0;
 
+                // Track request completion in the model performance tracker
+                global.modelTracker.trackRequestCompletion(requestId, {
+                    completionTokens: outputTokens,
+                    promptTokens: inputTokens,
+                    duration
+                });
+
                 updateMetrics(node, model, startTime, response.data);
 
                 // Enhanced successful API call logging
@@ -580,10 +855,13 @@ app.post('/chat', async (req, res) => {
                     completionTokens: outputTokens,
                     totalTokens,
                     tokensPerSecond: `${tokensPerSecond} tokens/sec`,
+                    resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
                     timestamp: new Date().toISOString()
                 });
                 return response;
             } catch (error) {
+                // Track error in the model performance tracker
+                global.modelTracker.trackRequestCompletion(requestId, {}, true);
                 // Enhanced error logging for API call failures
                 updateMetrics(node, model, startTime, null, true);
                 logger.error({
@@ -599,6 +877,7 @@ app.post('/chat', async (req, res) => {
                         data: error.response.data
                     } : 'No response',
                     duration: `${Date.now() - startTime}ms`,
+                    resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
                     timestamp: new Date().toISOString()
                 });
                 throw error;
@@ -985,11 +1264,21 @@ app.get('/admin/metrics', (req, res) => {
         uptime: Math.floor((Date.now() - metrics.startTime) / 1000)
     };
 
+    const enhancedMetrics = {
+        resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
+        queuePerformance: global.queueManager ? global.queueManager.getStatus() : null,
+        modelPerformance: global.modelTracker ? global.modelTracker.getAllModelMetrics() : null,
+        systemPerformance: global.modelTracker ? global.modelTracker.getSystemMetrics() : null,
+        modelConcurrencyRecommendations: global.modelTracker ?
+            global.modelTracker.getAllConcurrencyRecommendations() : null
+    };
+
     res.json({
         status: 'ok',
         data: {
             ...systemMetrics(),
-            system: systemStats
+            system: systemStats,
+            enhanced: enhancedMetrics
         }
     });
 
@@ -997,6 +1286,7 @@ app.get('/admin/metrics', (req, res) => {
         message: 'Metrics request successful',
         requestId,
         metricTypes: Object.keys(metrics),
+        enhancedMetrics: Object.keys(enhancedMetrics),
         nodeCount: Object.keys(metrics.nodePerformance).length,
         modelCount: Object.keys(metrics.modelPerformance).length,
         timestamp: new Date().toISOString()
@@ -1302,6 +1592,29 @@ process.on('SIGINT', () => {
         reason: 'SIGINT received',
         timestamp: new Date().toISOString()
     });
+
+    // Gracefully shut down components
+    if (global.resourceMonitor) {
+        global.resourceMonitor.stop();
+    }
+
+    if (global.queueManager) {
+        global.queueManager.stop();
+    }
+
+    if (global.modelTracker) {
+        global.modelTracker.stop();
+    }
+
+    // Final resource usage log
+    if (global.resourceMonitor) {
+        logger.info({
+            message: 'Final resource state',
+            metrics: global.resourceMonitor.getCurrentMetrics(),
+            timestamp: new Date().toISOString()
+        });
+    }
+
     process.exit(0);
 });
 
@@ -1311,6 +1624,29 @@ process.on('SIGTERM', () => {
         reason: 'SIGTERM received',
         timestamp: new Date().toISOString()
     });
+
+    // Gracefully shut down components
+    if (global.resourceMonitor) {
+        global.resourceMonitor.stop();
+    }
+
+    if (global.queueManager) {
+        global.queueManager.stop();
+    }
+
+    if (global.modelTracker) {
+        global.modelTracker.stop();
+    }
+
+    // Final resource usage log
+    if (global.resourceMonitor) {
+        logger.info({
+            message: 'Final resource state',
+            metrics: global.resourceMonitor.getCurrentMetrics(),
+            timestamp: new Date().toISOString()
+        });
+    }
+
     process.exit(0);
 });
 
