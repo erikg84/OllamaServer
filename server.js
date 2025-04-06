@@ -8,6 +8,13 @@ const ip = require('ip');
 const ResourceMonitor = require('./ResourceMonitor');
 const QueueConfigManager = require('./QueueConfigManager');
 const ModelPerformanceTracker = require('./ModelPerformanceTracker');
+const MemoryManager = require('./MemoryManager');
+const RequestCache = require('./RequestCache');
+const CacheKeyGenerator = require('./CacheKeyGenerator');
+const CacheMetrics = require('./CacheMetrics');
+const { CircuitBreaker, CircuitOpenError } = require('./CircuitBreaker');
+const PriorityQueue = require('./PriorityQueue');
+const createCacheMiddleware = require('./cache-middleware');
 
 // Adaptive concurrency configuration
 const CONCURRENCY_CONFIG = {
@@ -27,6 +34,119 @@ const CONCURRENCY_CONFIG = {
     ADJUSTMENT_COOLDOWN: process.env.ADJUSTMENT_COOLDOWN || 10000, // 10 seconds
     ADJUSTMENT_STEP: process.env.ADJUSTMENT_STEP || 1
 };
+
+const PRIORITY_QUEUE_CONFIG = {
+    // Concurrency settings (use the adaptive settings from existing config)
+    concurrency: CONCURRENCY_CONFIG.DEFAULT_CONCURRENCY,
+
+    // Priority levels configuration
+    maxConcurrentByPriority: {
+        [PriorityQueue.Priority.CRITICAL]: null,  // No limit for critical
+        [PriorityQueue.Priority.HIGH]: null,      // No limit for high
+        [PriorityQueue.Priority.NORMAL]: null,    // No limit for normal
+        [PriorityQueue.Priority.LOW]: 2,          // Max 2 low priority tasks
+        [PriorityQueue.Priority.BACKGROUND]: 1    // Max 1 background task
+    },
+
+    // Starvation prevention settings
+    agingFactor: process.env.PRIORITY_AGING_FACTOR || 30000, // 30 seconds
+    maxAgingBoost: process.env.PRIORITY_MAX_AGING_BOOST || 2,
+    maxWaitTime: process.env.PRIORITY_MAX_WAIT_TIME || 5 * 60 * 1000, // 5 minutes
+
+    // Queue fairness settings
+    fairnessReservedPercentage: process.env.PRIORITY_FAIRNESS_RESERVED || 20, // 20%
+
+    // Default priority level
+    defaultPriority: PriorityQueue.Priority.NORMAL
+};
+
+const CIRCUIT_BREAKER_CONFIG = {
+    // Error threshold percentage to trip the circuit (default: 50%)
+    errorThresholdPercentage: process.env.CIRCUIT_ERROR_THRESHOLD || 50,
+
+    // Minimum number of requests before the circuit can trip (default: 5)
+    requestVolumeThreshold: process.env.CIRCUIT_REQUEST_VOLUME || 5,
+
+    // How long to wait before trying half-open state (default: 30 seconds)
+    resetTimeout: process.env.CIRCUIT_RESET_TIMEOUT || 30000,
+
+    // Number of successful requests required to close circuit (default: 3)
+    successThreshold: process.env.CIRCUIT_SUCCESS_THRESHOLD || 3,
+
+    // Time window for calculating error rates (default: 60 seconds)
+    rollingWindow: process.env.CIRCUIT_ROLLING_WINDOW || 60000,
+
+    // Whether to track metrics by model (default: true)
+    trackByModel: process.env.CIRCUIT_TRACK_BY_MODEL !== 'false'
+};
+
+const MEMORY_CONFIG = {
+    // Memory thresholds (percentage of total system memory)
+    criticalMemoryThreshold: process.env.MEMORY_CRITICAL_THRESHOLD || 90,
+    warningMemoryThreshold: process.env.MEMORY_WARNING_THRESHOLD || 80,
+    healthyMemoryThreshold: process.env.MEMORY_HEALTHY_THRESHOLD || 60,
+
+    // Garbage collection settings
+    gcTriggerThreshold: process.env.MEMORY_GC_TRIGGER_THRESHOLD || 85,
+    gcCooldownPeriod: process.env.MEMORY_GC_COOLDOWN_PERIOD || 60000,
+
+    // Memory allocation settings
+    maxRequestMemoryMB: process.env.MEMORY_MAX_REQUEST_MB || 1024,
+    reservedSystemMemoryMB: process.env.MEMORY_RESERVED_SYSTEM_MB || 512,
+
+    // Memory monitoring settings
+    monitoringInterval: process.env.MEMORY_MONITORING_INTERVAL || 5000,
+
+    // Model-specific memory requirements (in MB)
+    modelMemoryRequirements: {
+        default: 512,             // Default for unknown models
+        'llama2': 1024,           // Base Llama 2 model
+        'llama2:7b': 768,         // 7B parameter model
+        'llama2:13b': 1024,       // 13B parameter model
+        'llama2:70b': 2048,       // 70B parameter model
+        'mistral': 768,           // Mistral base model
+        'mistral:7b': 768,        // 7B parameter model
+        'mixtral': 1536,          // Mixtral base model
+        'mixtral:8x7b': 1536,     // Mixtral 8x7B parameter model
+        'codellama': 1024,        // Code Llama base model
+        'wizardcoder': 1024,      // Wizard Coder model
+        'phi': 512,               // Phi base model
+        'phi:2': 512,             // Phi-2 model
+        'stablelm': 768           // StableLM model
+    }
+};
+
+// Cache configuration
+const CACHE_CONFIG = {
+    // Cache settings
+    enabled: process.env.CACHE_ENABLED !== 'false', // Default: true
+    maxSize: parseInt(process.env.CACHE_MAX_SIZE || '1000'), // Default: 1000 items
+    defaultTTL: parseInt(process.env.CACHE_TTL_MS || (30 * 60 * 1000)), // Default: 30 minutes
+
+    // Memory limits
+    maxMemoryMB: parseInt(process.env.CACHE_MAX_MEMORY_MB || '512'), // Default: 512MB
+
+    // Compression settings
+    compressResponses: process.env.CACHE_COMPRESS_RESPONSES !== 'false', // Default: true
+
+    // Model-specific settings
+    excludedModels: (process.env.CACHE_EXCLUDED_MODELS || '').split(',').filter(Boolean),
+
+    // Model-specific TTL (in milliseconds)
+    modelTTL: {
+        'default': 30 * 60 * 1000, // 30 minutes
+        'llama2': 60 * 60 * 1000, // 1 hour
+        'gpt4all': 24 * 60 * 60 * 1000, // 24 hours
+        'mistral': 6 * 60 * 60 * 1000, // 6 hours
+        'phi': 12 * 60 * 60 * 1000 // 12 hours
+    },
+
+    // Cache invalidation settings
+    autoInvalidate: process.env.CACHE_AUTO_INVALIDATE === 'true', // Default: false
+    invalidationPatterns: (process.env.CACHE_INVALIDATION_PATTERNS || '').split(',').filter(Boolean)
+};
+
+const createMemoryMiddleware = require('./memory-manager-middleware');
 
 // Get server identity information
 const SERVER_ID = {
@@ -160,6 +280,9 @@ app.use((req, res, next) => {
     next();
 });
 
+const memoryMiddleware = createMemoryMiddleware(logger);
+app.use(memoryMiddleware);
+
 /**
  * Estimate token count for a text prompt
  * This is a simple approximation - in production use a proper tokenizer
@@ -242,9 +365,9 @@ function sanitizeRequestBody(body) {
             timestamp: new Date().toISOString()
         });
 
-        const PQueue = (await import('p-queue')).default;
-        queue = new PQueue({
-            concurrency: CONCURRENCY_CONFIG.DEFAULT_CONCURRENCY,
+        queue = new PriorityQueue({
+            ...PRIORITY_QUEUE_CONFIG,
+            logger: logger,
             autoStart: true
         });
 
@@ -280,10 +403,108 @@ function sanitizeRequestBody(body) {
             logger: logger
         });
 
-        // Store instances for global access
+        const cacheKeyGenerator = new CacheKeyGenerator({
+            hashAlgorithm: 'sha256',
+            normalizeWhitespace: true,
+            logger: logger
+        });
+
+        const cacheMetrics = new CacheMetrics({
+            historyLength: 100,
+            metricsInterval: 60000, // 1 minute
+            samplingInterval: 5000, // 5 seconds
+            logger: logger
+        });
+
+        const requestCache = new RequestCache({
+            maxSize: CACHE_CONFIG.maxSize,
+            defaultTTL: CACHE_CONFIG.defaultTTL,
+            maxMemoryMB: CACHE_CONFIG.maxMemoryMB,
+            compressResponses: CACHE_CONFIG.compressResponses,
+            modelTTL: CACHE_CONFIG.modelTTL,
+            excludedModels: CACHE_CONFIG.excludedModels,
+            logger: logger
+        });
+
+        const circuitBreaker = new CircuitBreaker({
+            ...CIRCUIT_BREAKER_CONFIG,
+            logger: logger
+        });
+
+        const memoryManager = new MemoryManager({
+            ...MEMORY_CONFIG,
+            logger: logger
+        });
+
+        circuitBreaker.onStateChange((fromState, toState, timestamp) => {
+            logger.info({
+                message: 'Circuit state transition',
+                fromState,
+                toState,
+                timestamp: new Date(timestamp).toISOString()
+            });
+        });
+
+        global.circuitBreaker = circuitBreaker;
         global.resourceMonitor = resourceMonitor;
         global.queueManager = queueManager;
         global.modelTracker = modelTracker;
+        global.cacheKeyGenerator = cacheKeyGenerator;
+        global.cacheMetrics = cacheMetrics;
+        global.requestCache = requestCache;
+        global.memoryManager = memoryManager;
+        global.cacheEnabled = CACHE_CONFIG.enabled;
+        global.cacheExcludedModels = CACHE_CONFIG.excludedModels;
+        global.cacheModelTTL = CACHE_CONFIG.modelTTL;
+        global.defaultCacheTTL = CACHE_CONFIG.defaultTTL;
+
+        logger.info({
+            message: 'Cache initialized successfully',
+            enabled: CACHE_CONFIG.enabled,
+            maxSize: CACHE_CONFIG.maxSize,
+            defaultTTL: `${CACHE_CONFIG.defaultTTL / 1000 / 60} minutes`,
+            excludedModels: CACHE_CONFIG.excludedModels,
+            timestamp: new Date().toISOString()
+        });
+
+        logger.info({
+            message: 'Circuit breaker initialized',
+            initialState: circuitBreaker.state,
+            errorThreshold: `${CIRCUIT_BREAKER_CONFIG.errorThresholdPercentage}%`,
+            resetTimeout: `${CIRCUIT_BREAKER_CONFIG.resetTimeout}ms`,
+            trackByModel: CIRCUIT_BREAKER_CONFIG.trackByModel,
+            timestamp: new Date().toISOString()
+        });
+
+        logger.info({
+            message: 'PriorityQueue initialized',
+            initialConcurrency: queue.concurrency,
+            priorityLevels: Object.keys(PriorityQueue.Priority).length,
+            defaultPriority: PriorityQueue.getPriorityName(PRIORITY_QUEUE_CONFIG.defaultPriority),
+            fairnessReserved: `${PRIORITY_QUEUE_CONFIG.fairnessReservedPercentage}%`,
+            timestamp: new Date().toISOString()
+        });
+
+        if (typeof global.gc === 'function') {
+            logger.info({
+                message: 'Manual garbage collection available',
+                timestamp: new Date().toISOString()
+            });
+        } else {
+            logger.warn({
+                message: 'Manual garbage collection not available',
+                resolution: 'Run with node --expose-gc for better memory management',
+                timestamp: new Date().toISOString()
+            });
+        }
+
+        logger.info({
+            message: 'Memory manager initialized successfully',
+            totalMemory: `${Math.floor(os.totalmem() / (1024 * 1024))} MB`,
+            availableMemory: `${Math.floor(os.freemem() / (1024 * 1024))} MB`,
+            modelCount: Object.keys(MEMORY_CONFIG.modelMemoryRequirements).length,
+            timestamp: new Date().toISOString()
+        });
 
         // Add queue logging
         queue.on('add', () => {
@@ -345,6 +566,23 @@ function sanitizeRequestBody(body) {
                 timestamp: new Date().toISOString()
             });
         });
+
+        // Apply cache middleware if enabled
+        if (CACHE_CONFIG.enabled) {
+            const cacheMiddleware = createCacheMiddleware(
+                requestCache,
+                cacheKeyGenerator,
+                cacheMetrics,
+                logger
+            );
+
+            app.use(cacheMiddleware);
+
+            logger.info({
+                message: 'Cache middleware activated',
+                timestamp: new Date().toISOString()
+            });
+        }
     } catch (error) {
         logger.error({
             message: 'Failed to initialize server',
@@ -593,8 +831,208 @@ app.get('/health', async (req, res) => {
             stack: error.stack,
             timestamp: new Date().toISOString()
         });
-
+        if (global.memoryManager && req.memoryTracking) {
+            global.memoryManager.releaseRequestMemory(requestId);
+        }
         res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// Cache statistics endpoint
+app.get('/admin/cache', (req, res) => {
+    const requestId = req.id;
+
+    logger.info({
+        message: 'Cache stats requested',
+        requestId,
+        endpoint: '/admin/cache',
+        timestamp: new Date().toISOString()
+    });
+
+    if (!global.requestCache || !global.cacheMetrics) {
+        return res.status(503).json({
+            status: 'error',
+            message: 'Cache not initialized'
+        });
+    }
+
+    // Get cache statistics
+    const cacheStats = global.requestCache.getStats();
+    const metricsStats = global.cacheMetrics.getMetrics();
+    const performanceImpact = global.cacheMetrics.getPerformanceImpact();
+
+    const stats = {
+        cacheStats,
+        metrics: metricsStats,
+        performance: performanceImpact,
+        config: {
+            enabled: global.cacheEnabled,
+            excludedModels: global.cacheExcludedModels,
+            defaultTTL: global.defaultCacheTTL
+        }
+    };
+
+    logger.info({
+        message: 'Cache stats request successful',
+        requestId,
+        hitRate: metricsStats.summary.hitRate.current,
+        itemCount: cacheStats.size.current,
+        timestamp: new Date().toISOString()
+    });
+
+    res.json({
+        status: 'ok',
+        data: stats
+    });
+});
+
+// Cache clear endpoint
+app.post('/admin/cache/clear', (req, res) => {
+    const requestId = req.id;
+
+    logger.info({
+        message: 'Cache clear requested',
+        requestId,
+        endpoint: '/admin/cache/clear',
+        timestamp: new Date().toISOString()
+    });
+
+    if (!global.requestCache) {
+        return res.status(503).json({
+            status: 'error',
+            message: 'Cache not initialized'
+        });
+    }
+
+    try {
+        // Check for selective clearing options
+        const { modelId, pattern } = req.body;
+
+        // Default to clearing entire cache
+        let itemsCleared = 0;
+        let message = 'Cache cleared completely';
+
+        if (modelId) {
+            // TODO: Implement selective clearing by model
+            // This would require changes to RequestCache to support selective clearing
+            itemsCleared = global.requestCache.clear();
+            message = `Cache cleared (selective clearing by model not yet implemented)`;
+        } else if (pattern) {
+            // TODO: Implement selective clearing by pattern
+            // This would require changes to RequestCache to support pattern-based clearing
+            itemsCleared = global.requestCache.clear();
+            message = `Cache cleared (selective clearing by pattern not yet implemented)`;
+        } else {
+            // Clear entire cache
+            itemsCleared = global.requestCache.clear();
+        }
+
+        logger.info({
+            message: 'Cache cleared successfully',
+            requestId,
+            itemsCleared,
+            modelId,
+            pattern,
+            timestamp: new Date().toISOString()
+        });
+
+        res.json({
+            status: 'ok',
+            message,
+            itemsCleared
+        });
+    } catch (error) {
+        logger.error({
+            message: 'Error clearing cache',
+            requestId,
+            error: error.message,
+            stack: error.stack,
+            timestamp: new Date().toISOString()
+        });
+
+        res.status(500).json({
+            status: 'error',
+            message: error.message
+        });
+    }
+});
+
+// Cache configuration endpoint
+app.post('/admin/cache/config', (req, res) => {
+    const requestId = req.id;
+
+    logger.info({
+        message: 'Cache configuration update requested',
+        requestId,
+        endpoint: '/admin/cache/config',
+        requestBody: req.body,
+        timestamp: new Date().toISOString()
+    });
+
+    if (!global.requestCache) {
+        return res.status(503).json({
+            status: 'error',
+            message: 'Cache not initialized'
+        });
+    }
+
+    try {
+        const { enabled, excludedModels, modelTTL } = req.body;
+
+        // Update global cache enabled setting
+        if (enabled !== undefined) {
+            global.cacheEnabled = Boolean(enabled);
+            logger.info({
+                message: `Cache ${global.cacheEnabled ? 'enabled' : 'disabled'}`,
+                requestId,
+                timestamp: new Date().toISOString()
+            });
+        }
+
+        // Update excluded models
+        if (excludedModels && Array.isArray(excludedModels)) {
+            global.cacheExcludedModels = excludedModels;
+            logger.info({
+                message: 'Cache excluded models updated',
+                requestId,
+                excludedModels,
+                timestamp: new Date().toISOString()
+            });
+        }
+
+        // Update model TTL settings
+        if (modelTTL && typeof modelTTL === 'object') {
+            global.cacheModelTTL = { ...global.cacheModelTTL, ...modelTTL };
+            logger.info({
+                message: 'Cache model TTL settings updated',
+                requestId,
+                modelCount: Object.keys(modelTTL).length,
+                timestamp: new Date().toISOString()
+            });
+        }
+
+        res.json({
+            status: 'ok',
+            message: 'Cache configuration updated successfully',
+            config: {
+                enabled: global.cacheEnabled,
+                excludedModels: global.cacheExcludedModels,
+                modelTTL: global.cacheModelTTL
+            }
+        });
+    } catch (error) {
+        logger.error({
+            message: 'Error updating cache configuration',
+            requestId,
+            error: error.message,
+            stack: error.stack,
+            timestamp: new Date().toISOString()
+        });
+
+        res.status(500).json({
+            status: 'error',
+            message: error.message
+        });
     }
 });
 
@@ -605,12 +1043,37 @@ app.post('/generate', async (req, res) => {
     const node = req.body.node || 'unknown';
     const model = req.body.model || 'unknown';
 
+    const priorityName = req.body.priority || 'NORMAL';
+    let priority = PriorityQueue.Priority.NORMAL; // Default
+
+    // Map string priority to numeric value
+    if (typeof priorityName === 'string') {
+        switch (priorityName.toUpperCase()) {
+            case 'CRITICAL':
+                priority = PriorityQueue.Priority.CRITICAL;
+                break;
+            case 'HIGH':
+                priority = PriorityQueue.Priority.HIGH;
+                break;
+            case 'NORMAL':
+                priority = PriorityQueue.Priority.NORMAL;
+                break;
+            case 'LOW':
+                priority = PriorityQueue.Priority.LOW;
+                break;
+            case 'BACKGROUND':
+                priority = PriorityQueue.Priority.BACKGROUND;
+                break;
+        }
+    }
+
     // Enhanced generate request logging
     logger.info({
         message: 'Generate request received',
         requestId,
         model,
         node,
+        priority: PriorityQueue.getPriorityName(priority),
         promptLength: req.body.prompt ? req.body.prompt.length : 'undefined',
         options: req.body.options || {},
         resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
@@ -628,6 +1091,39 @@ app.post('/generate', async (req, res) => {
     }
 
     try {
+        if (global.circuitBreaker) {
+            try {
+                // Verify if circuit is closed or if we can allow this request
+                await global.circuitBreaker.execute(
+                    () => Promise.resolve(),
+                    { modelId: model }
+                );
+            } catch (error) {
+                if (error instanceof CircuitOpenError) {
+                    logger.warn({
+                        message: 'Generate request rejected by circuit breaker',
+                        requestId,
+                        model,
+                        node,
+                        circuitState: global.circuitBreaker.getModelState(model),
+                        nextAttemptTime: error.details.nextAttemptTime ?
+                            new Date(error.details.nextAttemptTime).toISOString() : 'unknown',
+                        timestamp: new Date().toISOString()
+                    });
+
+                    return res.status(503).json({
+                        status: 'error',
+                        message: 'Service temporarily unavailable',
+                        reason: 'circuit_open',
+                        details: {
+                            nextAttemptTime: error.details.nextAttemptTime ?
+                                new Date(error.details.nextAttemptTime).toISOString() : null
+                        }
+                    });
+                }
+                // For other errors, continue with the request
+            }
+        }
         // Track this request in the model performance tracker
         global.modelTracker.trackRequest(requestId, model, {
             promptTokens: req.body.prompt ? estimateTokenCount(req.body.prompt) : 0,
@@ -639,6 +1135,7 @@ app.post('/generate', async (req, res) => {
             message: 'Adding generate request to queue',
             requestId,
             model,
+            priority: PriorityQueue.getPriorityName(priority),
             queueSize: queue.size,
             queuePending: queue.pending,
             timestamp: new Date().toISOString()
@@ -659,50 +1156,72 @@ app.post('/generate', async (req, res) => {
             });
 
             try {
-                // Log API call attempt
-                logger.info({
-                    message: 'Making generate API call',
-                    requestId,
-                    endpoint: `${LLAMA_BASE_URL}/generate`,
-                    method: 'POST',
-                    model,
-                    timestamp: new Date().toISOString()
-                });
+                // Use circuit breaker to wrap API call
+                return await global.circuitBreaker.execute(async () => {
+                    // Log API call attempt
+                    logger.info({
+                        message: 'Making generate API call',
+                        requestId,
+                        endpoint: `${LLAMA_BASE_URL}/generate`,
+                        method: 'POST',
+                        model,
+                        timestamp: new Date().toISOString()
+                    });
 
-                const response = await axios.post(`${LLAMA_BASE_URL}/generate`, req.body);
+                    const response = await axios.post(`${LLAMA_BASE_URL}/generate`, req.body);
 
-                // Extract metrics from response for logging
-                const tokenCount = response.data.eval_count || 0;
-                const promptTokens = response.data.prompt_eval_count || 0;
-                const duration = Date.now() - startTime;
-                const tokensPerSecond = tokenCount > 0 ? (tokenCount / (duration / 1000)).toFixed(2) : 0;
+                    // Extract metrics from response for logging
+                    const tokenCount = response.data.eval_count || 0;
+                    const promptTokens = response.data.prompt_eval_count || 0;
+                    const duration = Date.now() - startTime;
+                    const tokensPerSecond = tokenCount > 0 ? (tokenCount / (duration / 1000)).toFixed(2) : 0;
 
-                // Track request completion in the model performance tracker
-                global.modelTracker.trackRequestCompletion(requestId, {
-                    tokenCount,
-                    promptTokens,
-                    duration
-                });
+                    // Track request completion in the model performance tracker
+                    global.modelTracker.trackRequestCompletion(requestId, {
+                        tokenCount,
+                        promptTokens,
+                        duration
+                    });
 
-                updateMetrics(node, model, startTime, response.data);
+                    updateMetrics(node, model, startTime, response.data);
 
-                // Enhanced successful API call logging
-                logger.info({
-                    message: 'Generate API call successful',
-                    requestId,
-                    model,
-                    node,
-                    duration: `${duration}ms`,
-                    responseSize: JSON.stringify(response.data).length,
-                    tokenCount,
-                    promptTokens,
-                    totalTokens: promptTokens + tokenCount,
-                    tokensPerSecond: `${tokensPerSecond} tokens/sec`,
-                    resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
-                    timestamp: new Date().toISOString()
-                });
-                return response;
+                    // Enhanced successful API call logging
+                    logger.info({
+                        message: 'Generate API call successful',
+                        requestId,
+                        model,
+                        node,
+                        duration: `${duration}ms`,
+                        responseSize: JSON.stringify(response.data).length,
+                        tokenCount,
+                        promptTokens,
+                        totalTokens: promptTokens + tokenCount,
+                        tokensPerSecond: `${tokensPerSecond} tokens/sec`,
+                        resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
+                        timestamp: new Date().toISOString()
+                    });
+                    return response;
+                }, { modelId: model }, { priority: priority } );
             } catch (error) {
+                // Check if this is a circuit open error
+                if (error instanceof CircuitOpenError) {
+                    logger.warn({
+                        message: 'Generate API call rejected by circuit breaker',
+                        requestId,
+                        model,
+                        node,
+                        circuitState: global.circuitBreaker.getModelState(model),
+                        timestamp: new Date().toISOString()
+                    });
+
+                    throw {
+                        status: 503,
+                        message: 'Service temporarily unavailable',
+                        reason: 'circuit_open',
+                        details: error.details
+                    };
+                }
+
                 global.modelTracker.trackRequestCompletion(requestId, {}, true);
                 updateMetrics(node, model, startTime, null, true);
                 logger.error({
@@ -732,9 +1251,21 @@ app.post('/generate', async (req, res) => {
             duration: `${Date.now() - startTime}ms`,
             timestamp: new Date().toISOString()
         });
-
+        if (global.memoryManager && req.memoryTracking) {
+            global.memoryManager.releaseRequestMemory(requestId);
+        }
         res.json(result.data);
     } catch (error) {
+        // Handle custom error format for circuit breaker
+        if (error.status === 503 && error.reason === 'circuit_open') {
+            return res.status(503).json({
+                status: 'error',
+                message: error.message,
+                reason: error.reason,
+                details: error.details
+            });
+        }
+
         logger.error({
             message: 'Generate request failed',
             requestId,
@@ -745,8 +1276,318 @@ app.post('/generate', async (req, res) => {
             duration: `${Date.now() - startTime}ms`,
             timestamp: new Date().toISOString()
         });
-
+        if (global.memoryManager && req.memoryTracking) {
+            global.memoryManager.releaseRequestMemory(requestId);
+        }
         res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+app.get('/admin/queue', (req, res) => {
+    const requestId = req.id;
+
+    logger.info({
+        message: 'Queue status requested',
+        requestId,
+        endpoint: '/admin/queue',
+        timestamp: new Date().toISOString()
+    });
+
+    if (!queue) {
+        return res.status(503).json({
+            status: 'error',
+            message: 'Queue not initialized'
+        });
+    }
+
+    // Get detailed queue statistics
+    const queueStats = queue.getStats();
+    const waitingTasks = queue.getWaitingTasksInfo();
+
+    // Get oldest waiting task for each priority
+    const oldestTasks = Object.keys(waitingTasks.oldestByPriority).map(priority => {
+        const task = waitingTasks.oldestByPriority[priority];
+        return {
+            priority: PriorityQueue.getPriorityName(parseInt(priority)),
+            addedTime: task.addedTime,
+            waitTime: Math.round(task.ageMs / 1000) + ' seconds',
+            taskId: task.taskId
+        };
+    });
+
+    // Sort by age (oldest first)
+    oldestTasks.sort((a, b) => {
+        return new Date(a.addedTime) - new Date(b.addedTime);
+    });
+
+    logger.info({
+        message: 'Queue status request successful',
+        requestId,
+        queueSize: queueStats.size,
+        queuePending: queueStats.pending,
+        priorityLevels: Object.keys(queueStats.pendingByPriority).length,
+        timestamp: new Date().toISOString()
+    });
+
+    res.json({
+        status: 'ok',
+        data: {
+            stats: queueStats,
+            waiting: waitingTasks,
+            oldestTasks: oldestTasks
+        }
+    });
+});
+
+// Add priority queue management endpoint
+app.post('/admin/queue', (req, res) => {
+    const requestId = req.id;
+
+    logger.info({
+        message: 'Queue management action requested',
+        requestId,
+        endpoint: '/admin/queue',
+        requestBody: req.body,
+        timestamp: new Date().toISOString()
+    });
+
+    if (!queue) {
+        return res.status(503).json({
+            status: 'error',
+            message: 'Queue not initialized'
+        });
+    }
+
+    try {
+        const { action, priority } = req.body;
+
+        switch (action) {
+            case 'pause':
+                queue.pause();
+                logger.info({
+                    message: 'Queue paused',
+                    requestId,
+                    timestamp: new Date().toISOString()
+                });
+                break;
+            case 'resume':
+            case 'start':
+                queue.start();
+                logger.info({
+                    message: 'Queue started',
+                    requestId,
+                    timestamp: new Date().toISOString()
+                });
+                break;
+            case 'clear':
+                const clearedCount = queue.clear();
+                logger.info({
+                    message: 'Queue cleared',
+                    requestId,
+                    clearedCount,
+                    timestamp: new Date().toISOString()
+                });
+                break;
+            default:
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'Invalid action. Use "pause", "resume", or "clear"'
+                });
+        }
+
+        // Get updated queue stats
+        const queueStats = queue.getStats();
+
+        res.json({
+            status: 'ok',
+            message: `Queue ${action} operation successful`,
+            currentState: {
+                isPaused: queueStats.isPaused,
+                size: queueStats.size,
+                pending: queueStats.pending
+            }
+        });
+    } catch (error) {
+        logger.error({
+            message: 'Error processing queue management action',
+            requestId,
+            error: error.message,
+            stack: error.stack,
+            timestamp: new Date().toISOString()
+        });
+
+        res.status(500).json({
+            status: 'error',
+            message: error.message
+        });
+    }
+});
+
+// Update /queue-status endpoint to return more detailed info
+app.get('/queue-status', (req, res) => {
+    const requestId = req.id;
+
+    logger.info({
+        message: 'Queue status requested',
+        requestId,
+        endpoint: '/queue-status',
+        timestamp: new Date().toISOString()
+    });
+
+    if (!queue) {
+        logger.error({
+            message: 'Queue not initialized',
+            requestId,
+            reason: 'Server still initializing',
+            timestamp: new Date().toISOString()
+        });
+        return res.status(503).json({ status: 'error', message: 'Server initializing' });
+    }
+
+    // Basic status
+    const status = {
+        size: queue.size,
+        pending: queue.pending,
+        isPaused: queue.isPaused,
+        // Add priority-based stats
+        pendingByPriority: {
+            critical: queue.getPendingCount(PriorityQueue.Priority.CRITICAL),
+            high: queue.getPendingCount(PriorityQueue.Priority.HIGH),
+            normal: queue.getPendingCount(PriorityQueue.Priority.NORMAL),
+            low: queue.getPendingCount(PriorityQueue.Priority.LOW),
+            background: queue.getPendingCount(PriorityQueue.Priority.BACKGROUND)
+        },
+        runningByPriority: {
+            critical: queue.getRunningCount(PriorityQueue.Priority.CRITICAL),
+            high: queue.getRunningCount(PriorityQueue.Priority.HIGH),
+            normal: queue.getRunningCount(PriorityQueue.Priority.NORMAL),
+            low: queue.getRunningCount(PriorityQueue.Priority.LOW),
+            background: queue.getRunningCount(PriorityQueue.Priority.BACKGROUND)
+        }
+    };
+
+    logger.info({
+        message: 'Queue status request successful',
+        requestId,
+        queueSize: status.size,
+        queuePending: status.pending,
+        queuePaused: status.isPaused,
+        timestamp: new Date().toISOString()
+    });
+
+    res.json(status);
+});
+
+app.get('/admin/circuit', (req, res) => {
+    const requestId = req.id;
+
+    logger.info({
+        message: 'Circuit breaker status requested',
+        requestId,
+        endpoint: '/admin/circuit',
+        timestamp: new Date().toISOString()
+    });
+
+    if (!global.circuitBreaker) {
+        return res.status(503).json({
+            status: 'error',
+            message: 'Circuit breaker not initialized'
+        });
+    }
+
+    // Get circuit breaker status
+    const status = global.circuitBreaker.getStatus();
+
+    logger.info({
+        message: 'Circuit breaker status request successful',
+        requestId,
+        globalState: status.global.state,
+        modelCount: Object.keys(status.models).length,
+        timestamp: new Date().toISOString()
+    });
+
+    res.json({
+        status: 'ok',
+        data: status
+    });
+});
+
+app.post('/admin/circuit', (req, res) => {
+    const requestId = req.id;
+
+    logger.info({
+        message: 'Circuit breaker action requested',
+        requestId,
+        endpoint: '/admin/circuit',
+        requestBody: req.body,
+        timestamp: new Date().toISOString()
+    });
+
+    if (!global.circuitBreaker) {
+        return res.status(503).json({
+            status: 'error',
+            message: 'Circuit breaker not initialized'
+        });
+    }
+
+    try {
+        const { action, modelId, timeout } = req.body;
+        let result = false;
+
+        switch (action) {
+            case 'open':
+                result = global.circuitBreaker.forceOpen({
+                    modelId,
+                    timeout: timeout ? parseInt(timeout, 10) : undefined
+                });
+                break;
+            case 'close':
+                result = global.circuitBreaker.forceClose({ modelId });
+                break;
+            case 'reset':
+                result = global.circuitBreaker.reset({ modelId });
+                break;
+            default:
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'Invalid action. Use "open", "close", or "reset"'
+                });
+        }
+
+        logger.info({
+            message: `Circuit breaker ${action} action successful`,
+            requestId,
+            action,
+            modelId: modelId || 'global',
+            result,
+            timestamp: new Date().toISOString()
+        });
+
+        // Get updated status
+        const status = global.circuitBreaker.getStatus();
+
+        res.json({
+            status: 'ok',
+            message: `Circuit breaker ${action} operation successful`,
+            action,
+            targetCircuit: modelId || 'global',
+            currentState: modelId ?
+                status.models[modelId]?.state : status.global.state,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        logger.error({
+            message: 'Error processing circuit breaker action',
+            requestId,
+            error: error.message,
+            stack: error.stack,
+            timestamp: new Date().toISOString()
+        });
+
+        res.status(500).json({
+            status: 'error',
+            message: error.message
+        });
     }
 });
 
@@ -858,6 +1699,9 @@ app.post('/chat', async (req, res) => {
                     resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
                     timestamp: new Date().toISOString()
                 });
+                if (global.memoryManager && req.memoryTracking) {
+                    global.memoryManager.releaseRequestMemory(requestId);
+                }
                 return response;
             } catch (error) {
                 // Track error in the model performance tracker
@@ -905,7 +1749,9 @@ app.post('/chat', async (req, res) => {
             duration: `${Date.now() - startTime}ms`,
             timestamp: new Date().toISOString()
         });
-
+        if (global.memoryManager && req.memoryTracking) {
+            global.memoryManager.releaseRequestMemory(requestId);
+        }
         res.status(500).json({ status: 'error', message: error.message });
     }
 });
@@ -1051,8 +1897,228 @@ app.get('/models', async (req, res) => {
             duration: `${Date.now() - startTime}ms`,
             timestamp: new Date().toISOString()
         });
-
+        if (global.memoryManager && req.memoryTracking) {
+            global.memoryManager.releaseRequestMemory(requestId);
+        }
         res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+app.get('/admin/memory', (req, res) => {
+    const requestId = req.id;
+
+    logger.info({
+        message: 'Memory stats requested',
+        requestId,
+        endpoint: '/admin/memory',
+        timestamp: new Date().toISOString()
+    });
+
+    if (!global.memoryManager) {
+        return res.status(503).json({
+            status: 'error',
+            message: 'Memory manager not initialized'
+        });
+    }
+
+    // Get detailed memory statistics
+    const memoryStats = global.memoryManager.getMemoryStats();
+
+    logger.info({
+        message: 'Memory stats request successful',
+        requestId,
+        memoryState: memoryStats.current.state,
+        activeRequests: memoryStats.activeRequests.count,
+        timestamp: new Date().toISOString()
+    });
+
+    res.json({
+        status: 'ok',
+        data: memoryStats
+    });
+});
+
+// Memory forecast endpoint
+app.post('/admin/memory/forecast', (req, res) => {
+    const requestId = req.id;
+
+    logger.info({
+        message: 'Memory forecast requested',
+        requestId,
+        endpoint: '/admin/memory/forecast',
+        timestamp: new Date().toISOString()
+    });
+
+    if (!global.memoryManager) {
+        return res.status(503).json({
+            status: 'error',
+            message: 'Memory manager not initialized'
+        });
+    }
+
+    // Get queued requests from request body, or use current queue if not provided
+    const queuedRequests = req.body.queuedRequests ||
+        (queue ? Array.from({ length: queue.size }, () => ({ model: 'default' })) : []);
+
+    // Get memory forecast
+    const forecast = global.memoryManager.getForecastedMemoryUsage(queuedRequests);
+
+    logger.info({
+        message: 'Memory forecast request successful',
+        requestId,
+        currentState: forecast.current.state,
+        forecastedState: forecast.forecasted.state,
+        queuedRequests: queuedRequests.length,
+        timestamp: new Date().toISOString()
+    });
+
+    res.json({
+        status: 'ok',
+        data: forecast
+    });
+});
+
+// Update model memory requirements
+app.post('/admin/memory/models', (req, res) => {
+    const requestId = req.id;
+
+    logger.info({
+        message: 'Model memory requirements update requested',
+        requestId,
+        endpoint: '/admin/memory/models',
+        requestBody: req.body,
+        timestamp: new Date().toISOString()
+    });
+
+    if (!global.memoryManager) {
+        return res.status(503).json({
+            status: 'error',
+            message: 'Memory manager not initialized'
+        });
+    }
+
+    try {
+        // Update model memory requirements
+        const updated = global.memoryManager.updateModelMemoryRequirements(req.body);
+
+        if (!updated) {
+            logger.warn({
+                message: 'Invalid model memory requirements',
+                requestId,
+                requestBody: req.body,
+                timestamp: new Date().toISOString()
+            });
+
+            return res.status(400).json({
+                status: 'error',
+                message: 'Invalid model memory requirements'
+            });
+        }
+
+        logger.info({
+            message: 'Model memory requirements updated successfully',
+            requestId,
+            modelCount: Object.keys(req.body).length,
+            timestamp: new Date().toISOString()
+        });
+
+        res.json({
+            status: 'ok',
+            message: 'Model memory requirements updated successfully',
+            data: global.memoryManager.getMemoryStats().modelMemorySettings
+        });
+    } catch (error) {
+        logger.error({
+            message: 'Error updating model memory requirements',
+            requestId,
+            error: error.message,
+            stack: error.stack,
+            timestamp: new Date().toISOString()
+        });
+
+        res.status(500).json({
+            status: 'error',
+            message: error.message
+        });
+    }
+});
+
+// Force garbage collection endpoint
+app.post('/admin/memory/gc', (req, res) => {
+    const requestId = req.id;
+
+    logger.info({
+        message: 'Garbage collection requested',
+        requestId,
+        endpoint: '/admin/memory/gc',
+        timestamp: new Date().toISOString()
+    });
+
+    if (!global.memoryManager) {
+        return res.status(503).json({
+            status: 'error',
+            message: 'Memory manager not initialized'
+        });
+    }
+
+    try {
+        // Get memory before GC
+        const memoryBefore = global.memoryManager.getCurrentMemoryUsage();
+
+        // Trigger garbage collection
+        const gcResult = global.memoryManager.triggerGarbageCollection();
+
+        if (!gcResult) {
+            logger.warn({
+                message: 'Garbage collection not available',
+                requestId,
+                timestamp: new Date().toISOString()
+            });
+
+            return res.status(400).json({
+                status: 'error',
+                message: 'Garbage collection not available. Run Node.js with --expose-gc flag.'
+            });
+        }
+
+        // Get memory after GC
+        const memoryAfter = global.memoryManager.getCurrentMemoryUsage();
+
+        // Calculate difference
+        const memoryFreed = memoryBefore.processMemory.heapUsed - memoryAfter.processMemory.heapUsed;
+        const memoryFreedMB = Math.floor(memoryFreed / (1024 * 1024));
+
+        logger.info({
+            message: 'Garbage collection completed successfully',
+            requestId,
+            memoryFreedMB,
+            newMemoryState: memoryAfter.state,
+            timestamp: new Date().toISOString()
+        });
+
+        res.json({
+            status: 'ok',
+            message: 'Garbage collection completed successfully',
+            data: {
+                memoryBefore,
+                memoryAfter,
+                memoryFreedMB,
+                gcCount: global.memoryManager.gcCount
+            }
+        });
+    } catch (error) {
+        logger.error({
+            message: 'Error triggering garbage collection',
+            requestId,
+            error: error.message,
+            stack: error.stack,
+            timestamp: new Date().toISOString()
+        });
+
+        res.status(500).json({
+            status: 'error',
+            message: error.message
+        });
     }
 });
 
@@ -1265,12 +2331,28 @@ app.get('/admin/metrics', (req, res) => {
     };
 
     const enhancedMetrics = {
+        memoryStats: global.memoryManager ? global.memoryManager.getCurrentMemoryUsage() : null,
         resourceUsage: global.resourceMonitor ? global.resourceMonitor.getCurrentMetrics() : null,
         queuePerformance: global.queueManager ? global.queueManager.getStatus() : null,
         modelPerformance: global.modelTracker ? global.modelTracker.getAllModelMetrics() : null,
         systemPerformance: global.modelTracker ? global.modelTracker.getSystemMetrics() : null,
         modelConcurrencyRecommendations: global.modelTracker ?
-            global.modelTracker.getAllConcurrencyRecommendations() : null
+            global.modelTracker.getAllConcurrencyRecommendations() : null,
+        queueMetrics: queue ? {
+            waitTimes: {
+                average: queue.getStats().performance.waitTime.average,
+                byPriority: queue.getStats().performance.waitTime.byPriority
+            },
+            completedTasks: {
+                total: queue.getStats().performance.completed,
+                byPriority: queue.getStats().performance.completedByPriority
+            },
+            priorityBoosts: queue.getStats().performance.priorityBoosts,
+            fairnessSettings: {
+                reservedPercentage: queue.getStats().config.fairnessReservedPercentage,
+                maxConcurrentByPriority: queue.getStats().config.maxConcurrentByPriority
+            }
+        } : null
     };
 
     res.json({
@@ -1518,8 +2600,20 @@ app.get('/admin/logs', async (req, res) => {
 
 // Add periodic health logging
 setInterval(() => {
+    if (global.requestCache && global.cacheMetrics) {
+        const metrics = global.cacheMetrics.getMetrics();
+        healthInfo.cache = {
+            enabled: global.cacheEnabled,
+            size: global.requestCache.getStats().size.current,
+            hitRate: metrics.summary.hitRate.current,
+            timeSaved: metrics.summary.performance.totalTimeSaved
+        };
+    }
+
     const memoryUsage = process.memoryUsage();
     logger.info({
+        memoryState: global.memoryManager ? global.memoryManager.getCurrentMemoryUsage().state : 'N/A',
+        activeMemoryRequests: global.memoryManager ? global.memoryManager.activeRequests.size : 'N/A',
         message: 'System health stats',
         uptime: Math.floor(process.uptime()),
         memoryUsage: {
@@ -1606,7 +2700,10 @@ process.on('SIGINT', () => {
         global.modelTracker.stop();
     }
 
-    // Final resource usage log
+    if (global.circuitBreaker) {
+        global.circuitBreaker.stop();
+    }
+
     if (global.resourceMonitor) {
         logger.info({
             message: 'Final resource state',
@@ -1614,7 +2711,24 @@ process.on('SIGINT', () => {
             timestamp: new Date().toISOString()
         });
     }
+    if (global.requestCache) {
+        // Stop caching components
+        global.requestCache.stop();
+        global.cacheMetrics.stop();
 
+        logger.info({
+            message: 'Cache components stopped',
+            timestamp: new Date().toISOString()
+        });
+    }
+    if (queue) {
+        queue.stop();
+
+        logger.info({
+            message: 'PriorityQueue stopped',
+            timestamp: new Date().toISOString()
+        });
+    }
     process.exit(0);
 });
 
@@ -1646,7 +2760,24 @@ process.on('SIGTERM', () => {
             timestamp: new Date().toISOString()
         });
     }
+    if (global.requestCache) {
+        // Stop caching components
+        global.requestCache.stop();
+        global.cacheMetrics.stop();
 
+        logger.info({
+            message: 'Cache components stopped',
+            timestamp: new Date().toISOString()
+        });
+    }
+    if (queue) {
+        queue.stop();
+
+        logger.info({
+            message: 'PriorityQueue stopped',
+            timestamp: new Date().toISOString()
+        });
+    }
     process.exit(0);
 });
 
