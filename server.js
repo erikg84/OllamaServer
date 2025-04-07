@@ -17,6 +17,7 @@ const PriorityQueue = require('./PriorityQueue');
 const GpuMonitor = require('./GpuMonitor');
 const OllamaHealthMonitor = require('./OllamaHealthMonitor');
 const TimeoutManager = require('./TimeoutManager');
+const { MongoClient } = require('mongodb');
 const createCacheMiddleware = require('./cache-middleware');
 
 // Adaptive concurrency configuration
@@ -160,7 +161,6 @@ const SERVER_ID = {
     nodeVersion: process.version
 };
 
-// Set up logger with enhanced configuration
 const logger = winston.createLogger({
     level: 'info',
     format: winston.format.combine(
@@ -172,8 +172,8 @@ const logger = winston.createLogger({
         serverId: SERVER_ID.ipAddress,
         hostname: SERVER_ID.hostname,
         environment: process.env.NODE_ENV || 'development',
-        application: 'llama-server', // Add application identifier
-        version: '1.0.0' // Add version information
+        application: 'llama-server',
+        version: '1.0.0'
     },
     transports: [
         new winston.transports.Console({
@@ -185,25 +185,33 @@ const logger = winston.createLogger({
             )
         }),
         new winston.transports.File({ filename: 'server.log' }),
-        // Add MongoDB transport for centralized logging
+        // Modify MongoDB transport
         new winston.transports.MongoDB({
             db: 'mongodb://192.168.68.145:27017/logs',
             collection: 'logs',
             options: {
-                useUnifiedTopology: true
-            }
+                connectTimeoutMS: 10000,
+                serverSelectionTimeoutMS: 10000
+            },
+            // Add error handling
+            handleExceptions: true,
+            silent: false
         })
     ],
-    // Add exception handlers
     exceptionHandlers: [
         new winston.transports.File({ filename: 'exceptions.log' }),
-        new winston.transports.MongoDB({
-            db: 'mongodb://192.168.68.145:27017/logs',
-            collection: 'exceptions',
-            options: {
-                useUnifiedTopology: true
-            }
-        })
+        // Conditional MongoDB exception logging
+        ...(process.env.NODE_ENV !== 'development' ? [
+            new winston.transports.MongoDB({
+                db: 'mongodb://192.168.68.145:27017/logs',
+                collection: 'exceptions',
+                options: {
+                    useNewUrlParser: true,
+                    connectTimeoutMS: 10000,
+                    serverSelectionTimeoutMS: 10000
+                }
+            })
+        ] : [])
     ]
 });
 
@@ -227,7 +235,9 @@ const OLLAMA_HEALTH_MONITOR_CONFIG = {
     checkInterval: parseInt(process.env.OLLAMA_HEALTH_CHECK_INTERVAL || '30000'), // 30 seconds
     timeoutThreshold: parseInt(process.env.OLLAMA_TIMEOUT_THRESHOLD || '10000'), // 10 seconds
     maxFailedChecks: parseInt(process.env.OLLAMA_MAX_FAILED_CHECKS || '3'),
-    restartCommand: process.env.OLLAMA_RESTART_COMMAND || 'systemctl restart ollama',
+    restartCommand: process.platform === 'win32'
+        ? 'net stop ollama && net start ollama'
+        : 'systemctl restart ollama',
     logger: logger
 };
 
@@ -242,7 +252,7 @@ let queue = new PriorityQueue({
 });
 
 // Llama API base URL
-const LLAMA_BASE_URL = 'http://127.0.0.1:11434/api';
+const LLAMA_BASE_URL = process.env.OLLAMA_API_URL || 'http://localhost:11434/api';
 
 // Log application startup
 logger.info({
@@ -274,6 +284,37 @@ const GPU_CONFIG = {
     },
     logger: logger
 };
+
+function connectToMongoDB() {
+    const mongoUrl = 'mongodb://192.168.68.145:27017/logs';
+
+    MongoClient.connect(mongoUrl, {
+        useNewUrlParser: true,
+        connectTimeoutMS: 10000,
+        serverSelectionTimeoutMS: 10000
+    })
+        .then(client => {
+            logger.info({
+                message: 'MongoDB connection established successfully',
+                url: mongoUrl,
+                timestamp: new Date().toISOString()
+            });
+            // Optionally, you can store the client for later use
+            global.mongoClient = client;
+        })
+        .catch(error => {
+            logger.error({
+                message: 'Failed to connect to MongoDB',
+                error: error.message,
+                stack: error.stack,
+                url: mongoUrl,
+                timestamp: new Date().toISOString()
+            });
+
+            // Optional: Retry mechanism
+            setTimeout(connectToMongoDB, 10000);
+        });
+}
 
 // Add request ID middleware
 app.use((req, res, next) => {
@@ -437,11 +478,7 @@ function adjustConcurrencyBasedOnGpuMetrics(currentConcurrency) {
             timestamp: new Date().toISOString()
         });
 
-        // queue = new PriorityQueue({
-        //     ...PRIORITY_QUEUE_CONFIG,
-        //     logger: logger,
-        //     autoStart: true
-        // });
+        connectToMongoDB();
 
         // Initialize resource monitor
         const resourceMonitor = new ResourceMonitor({
