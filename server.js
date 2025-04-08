@@ -1024,7 +1024,7 @@ function systemMetrics() {
         if (!enhancedMetrics.responseTimes[nodeId]) {
             enhancedMetrics.responseTimes[nodeId] = Array.from({ length: 12 }, (_, i) => ({
                 time: `${i * 5}m`,
-                value: 0 
+                value: 0
             }));
         }
     });
@@ -1223,6 +1223,229 @@ app.get('/admin/logs', async (req, res) => {
             message: 'Failed to retrieve logs',
             error: error.message
         });
+    }
+});
+
+// Stream chat endpoint
+app.post('/chat/stream', async (req, res) => {
+    const requestId = req.id;
+    const startTime = Date.now();
+    const node = req.body.node || 'unknown';
+    const model = req.body.model || 'unknown';
+
+    // Enhanced stream chat request logging
+    logger.info({
+        message: 'Stream chat request received',
+        requestId,
+        model,
+        node,
+        messagesCount: req.body.messages ? req.body.messages.length : 'undefined',
+        options: req.body.options || {},
+        systemPromptLength: req.body.system ? req.body.system.length : 0,
+        timestamp: new Date().toISOString()
+    });
+
+    // Force stream parameter to true
+    const modifiedBody = {
+        ...req.body,
+        stream: true
+    };
+
+    if (!queue) {
+        logger.error({
+            message: 'Queue not initialized',
+            requestId,
+            reason: 'Server still initializing',
+            timestamp: new Date().toISOString()
+        });
+        return res.status(503).json({ status: 'error', message: 'Server initializing' });
+    }
+
+    // Set headers for streaming
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // Prevents buffering for Nginx proxies
+
+    try {
+        logger.info({
+            message: 'Adding stream chat request to queue',
+            requestId,
+            model,
+            queueSize: queue.size,
+            queuePending: queue.pending,
+            timestamp: new Date().toISOString()
+        });
+
+        // Process stream in the queue
+        queue.add(async () => {
+            const queueWaitTime = Date.now() - startTime;
+
+            logger.info({
+                message: 'Executing stream chat request',
+                requestId,
+                model,
+                node,
+                queueWaitTime: `${queueWaitTime}ms`,
+                startTime: new Date(startTime).toISOString(),
+                timestamp: new Date().toISOString()
+            });
+
+            try {
+                // Make streaming request to Ollama
+                const response = await axios.post(`${LLAMA_BASE_URL}/chat`, modifiedBody, {
+                    responseType: 'stream'
+                });
+
+                // Counters for metrics
+                let outputTokens = 0;
+                let fullResponse = '';
+
+                // Process the stream
+                response.data.on('data', (chunk) => {
+                    try {
+                        // Convert chunk to string and forward to client
+                        const chunkStr = chunk.toString();
+                        res.write(chunkStr);
+
+                        // Try to parse JSON chunks for metrics
+                        try {
+                            const jsonChunks = chunkStr
+                                .split('\n')
+                                .filter(line => line.trim())
+                                .map(line => JSON.parse(line));
+
+                            // Process each JSON chunk
+                            jsonChunks.forEach(jsonChunk => {
+                                if (jsonChunk.message && jsonChunk.message.content) {
+                                    // Accumulate full response for logging
+                                    fullResponse += jsonChunk.message.content;
+                                    // Approximate token count for metrics
+                                    outputTokens += jsonChunk.message.content.split(/\s+/).length;
+                                }
+
+                                // If we have done metrics in the response
+                                if (jsonChunk.done && jsonChunk.total_duration) {
+                                    logger.info({
+                                        message: 'Stream chunk metrics received',
+                                        requestId,
+                                        model,
+                                        duration: jsonChunk.total_duration,
+                                        tokensPerSecond: jsonChunk.eval_rate,
+                                        timestamp: new Date().toISOString()
+                                    });
+                                }
+                            });
+                        } catch (parseError) {
+                            // Not all chunks may be valid JSON, which is ok
+                        }
+                    } catch (chunkError) {
+                        logger.error({
+                            message: 'Error processing stream chunk',
+                            requestId,
+                            error: chunkError.message,
+                            timestamp: new Date().toISOString()
+                        });
+                    }
+                });
+
+                // Handle stream end
+                response.data.on('end', () => {
+                    const duration = Date.now() - startTime;
+
+                    // Add placeholder metrics data
+                    const metricsData = {
+                        usage: {
+                            prompt_tokens: req.body.messages ? req.body.messages.reduce((sum, msg) =>
+                                sum + (msg.content ? msg.content.split(/\s+/).length : 0), 0) : 0,
+                            completion_tokens: outputTokens,
+                            total_tokens: outputTokens + (req.body.messages ? req.body.messages.reduce((sum, msg) =>
+                                sum + (msg.content ? msg.content.split(/\s+/).length : 0), 0) : 0)
+                        }
+                    };
+
+                    updateMetrics(node, model, startTime, metricsData);
+
+                    logger.info({
+                        message: 'Stream chat completed',
+                        requestId,
+                        model,
+                        node,
+                        duration: `${duration}ms`,
+                        outputTokens,
+                        responseLength: fullResponse.length,
+                        timestamp: new Date().toISOString()
+                    });
+
+                    // End the response
+                    res.end();
+                });
+
+                // Handle stream error
+                response.data.on('error', (error) => {
+                    logger.error({
+                        message: 'Stream error',
+                        requestId,
+                        error: error.message,
+                        timestamp: new Date().toISOString()
+                    });
+
+                    updateMetrics(node, model, startTime, null, true);
+
+                    // Send error to client and end stream
+                    res.write(JSON.stringify({ error: error.message }));
+                    res.end();
+                });
+            } catch (error) {
+                // Handle Axios errors
+                updateMetrics(node, model, startTime, null, true);
+                logger.error({
+                    message: 'Stream chat API call failed',
+                    requestId,
+                    model,
+                    node,
+                    error: error.message,
+                    errorCode: error.code,
+                    errorResponse: error.response ? {
+                        status: error.response.status,
+                        statusText: error.response.statusText,
+                        data: error.response.data
+                    } : 'No response',
+                    duration: `${Date.now() - startTime}ms`,
+                    timestamp: new Date().toISOString()
+                });
+
+                // Send error to client and end stream
+                res.write(JSON.stringify({ error: error.message }));
+                res.end();
+            }
+        }).catch(error => {
+            // Handle queue errors
+            logger.error({
+                message: 'Queue error for stream chat',
+                requestId,
+                error: error.message,
+                stack: error.stack,
+                timestamp: new Date().toISOString()
+            });
+
+            // Send error to client and end stream
+            res.write(JSON.stringify({ error: error.message }));
+            res.end();
+        });
+    } catch (error) {
+        // Handle uncaught errors
+        logger.error({
+            message: 'Uncaught error in stream chat',
+            requestId,
+            error: error.message,
+            stack: error.stack,
+            timestamp: new Date().toISOString()
+        });
+
+        // Send error to client and end stream
+        res.write(JSON.stringify({ error: error.message }));
+        res.end();
     }
 });
 
