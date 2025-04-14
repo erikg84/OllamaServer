@@ -5,6 +5,9 @@ require('winston-mongodb');
 const os = require('os');
 const { v4: uuidv4 } = require('uuid');
 const ip = require('ip');
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
 
 // Get server identity information
 const SERVER_ID = {
@@ -60,6 +63,31 @@ const logger = winston.createLogger({
             }
         })
     ]
+});
+
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+    logger.info({
+        message: 'Created uploads directory',
+        path: uploadsDir,
+        timestamp: new Date().toISOString()
+    });
+}
+
+const upload = multer({
+    dest: 'uploads/',
+    limits: {
+        fileSize: 10 * 1024 * 1024, // Limit to 10MB
+    },
+    fileFilter: (req, file, cb) => {
+        // Accept image files only
+        if (file.mimetype.startsWith('image/')) {
+            cb(null, true);
+        } else {
+            cb(new Error('Only image files are allowed'), false);
+        }
+    }
 });
 
 const app = express();
@@ -253,6 +281,565 @@ function sanitizeRequestBody(body) {
         process.exit(1);
     }
 })();
+
+app.get('/vision-models', async (req, res) => {
+    const requestId = req.id;
+
+    logger.info({
+        message: 'Vision models list requested',
+        requestId,
+        endpoint: '/vision-models',
+        timestamp: new Date().toISOString()
+    });
+
+    if (!queue) {
+        logger.error({
+            message: 'Queue not initialized',
+            requestId,
+            reason: 'Server still initializing',
+            timestamp: new Date().toISOString()
+        });
+        return res.status(503).json({ status: 'error', message: 'Server initializing' });
+    }
+
+    try {
+        logger.info({
+            message: 'Adding vision models list request to queue',
+            requestId,
+            queueSize: queue.size,
+            queuePending: queue.pending,
+            timestamp: new Date().toISOString()
+        });
+
+        const startTime = Date.now();
+        const result = await queue.add(async () => {
+            logger.info({
+                message: 'Executing vision models list request',
+                requestId,
+                startTime: new Date(startTime).toISOString(),
+                timestamp: new Date().toISOString()
+            });
+
+            try {
+                // Log API call attempt
+                logger.info({
+                    message: 'Making models list API call',
+                    requestId,
+                    endpoint: `${LLAMA_BASE_URL}/tags`,
+                    method: 'GET',
+                    timestamp: new Date().toISOString()
+                });
+
+                const response = await axios.get(`${LLAMA_BASE_URL}/tags`);
+
+                // Filter for vision-capable models
+                // This is a simplified filter that looks for models that might have vision capabilities
+                // based on their names. A more accurate approach would be to check model capabilities explicitly.
+                const visionModels = response.data.models
+                    .filter(model => {
+                        const modelName = model.model.toLowerCase();
+                        return modelName.includes('llava') ||
+                            modelName.includes('vision') ||
+                            modelName.includes('bakllava') ||
+                            modelName.includes('llama3.2-vision');
+                    })
+                    .map(model => ({
+                        id: model.model,
+                        name: model.name || model.model,
+                        type: model.details?.family || "unknown",
+                        size: model.size,
+                        quantization: model.details?.quantization_level || "unknown"
+                    }));
+
+                logger.info({
+                    message: 'Vision models list API call successful',
+                    requestId,
+                    duration: `${Date.now() - startTime}ms`,
+                    modelsCount: visionModels.length,
+                    responseSize: JSON.stringify(visionModels).length,
+                    timestamp: new Date().toISOString()
+                });
+
+                return { data: visionModels };
+            } catch (error) {
+                // Enhanced error logging for API call failures
+                logger.error({
+                    message: 'Vision models list API call failed',
+                    requestId,
+                    error: error.message,
+                    errorCode: error.code,
+                    errorResponse: error.response ? {
+                        status: error.response.status,
+                        statusText: error.response.statusText,
+                        data: error.response.data
+                    } : 'No response',
+                    duration: `${Date.now() - startTime}ms`,
+                    timestamp: new Date().toISOString()
+                });
+                throw error;
+            }
+        });
+
+        logger.info({
+            message: 'Vision models list request successful',
+            requestId,
+            duration: `${Date.now() - startTime}ms`,
+            modelsCount: result.data.length,
+            timestamp: new Date().toISOString()
+        });
+
+        res.json(result.data);
+    } catch (error) {
+        logger.error({
+            message: 'Vision models list request failed',
+            requestId,
+            error: error.message,
+            stack: error.stack,
+            timestamp: new Date().toISOString()
+        });
+
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+app.post('/vision/stream', upload.single('image'), async (req, res) => {
+    const requestId = req.id;
+    const startTime = Date.now();
+    const model = req.body.model || 'llava:13b'; // Default to LLaVA
+    const prompt = req.body.prompt || 'Describe this image in detail';
+    const node = req.body.node || 'unknown';
+
+    // Enhanced vision stream request logging
+    logger.info({
+        message: 'Vision stream analysis request received',
+        requestId,
+        model,
+        node,
+        prompt,
+        imageSize: req.file ? req.file.size : 'No file uploaded',
+        timestamp: new Date().toISOString()
+    });
+
+    if (!req.file) {
+        logger.error({
+            message: 'No image file provided',
+            requestId,
+            timestamp: new Date().toISOString()
+        });
+        return res.status(400).json({ status: 'error', message: 'No image file provided' });
+    }
+
+    if (!queue) {
+        logger.error({
+            message: 'Queue not initialized',
+            requestId,
+            reason: 'Server still initializing',
+            timestamp: new Date().toISOString()
+        });
+        return res.status(503).json({ status: 'error', message: 'Server initializing' });
+    }
+
+    // Set headers for streaming
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // Prevents buffering for Nginx proxies
+
+    try {
+        logger.info({
+            message: 'Adding vision stream request to queue',
+            requestId,
+            model,
+            queueSize: queue.size,
+            queuePending: queue.pending,
+            timestamp: new Date().toISOString()
+        });
+
+        // Process stream in the queue
+        queue.add(async () => {
+            const queueWaitTime = Date.now() - startTime;
+
+            logger.info({
+                message: 'Executing vision stream request',
+                requestId,
+                model,
+                node,
+                queueWaitTime: `${queueWaitTime}ms`,
+                startTime: new Date(startTime).toISOString(),
+                timestamp: new Date().toISOString()
+            });
+
+            try {
+                // Read the image file and convert to base64
+                const imageBuffer = fs.readFileSync(req.file.path);
+                const base64Image = imageBuffer.toString('base64');
+
+                // Prepare the request for Ollama
+                const requestBody = {
+                    model: model,
+                    stream: true,
+                    messages: [
+                        {
+                            role: 'user',
+                            content: prompt,
+                            images: [base64Image]
+                        }
+                    ]
+                };
+
+                // Make streaming request to Ollama
+                const response = await axios.post(`${LLAMA_BASE_URL}/chat`, requestBody, {
+                    responseType: 'stream'
+                });
+
+                // Counters for metrics
+                let outputTokens = 0;
+                let fullResponse = '';
+
+                // Process the stream
+                response.data.on('data', (chunk) => {
+                    try {
+                        // Convert chunk to string and forward to client
+                        const chunkStr = chunk.toString();
+                        res.write(chunkStr);
+
+                        // Try to parse JSON chunks for metrics
+                        try {
+                            const jsonChunks = chunkStr
+                                .split('\n')
+                                .filter(line => line.trim())
+                                .map(line => JSON.parse(line));
+
+                            // Process each JSON chunk
+                            jsonChunks.forEach(jsonChunk => {
+                                if (jsonChunk.message && jsonChunk.message.content) {
+                                    // Accumulate full response for logging
+                                    fullResponse += jsonChunk.message.content;
+                                    // Approximate token count for metrics
+                                    outputTokens += jsonChunk.message.content.split(/\s+/).length;
+                                }
+
+                                // If we have done metrics in the response
+                                if (jsonChunk.done && jsonChunk.total_duration) {
+                                    logger.info({
+                                        message: 'Vision stream chunk metrics received',
+                                        requestId,
+                                        model,
+                                        duration: jsonChunk.total_duration,
+                                        tokensPerSecond: jsonChunk.eval_rate,
+                                        timestamp: new Date().toISOString()
+                                    });
+                                }
+                            });
+                        } catch (parseError) {
+                            // Not all chunks may be valid JSON, which is ok
+                        }
+                    } catch (chunkError) {
+                        logger.error({
+                            message: 'Error processing vision stream chunk',
+                            requestId,
+                            error: chunkError.message,
+                            timestamp: new Date().toISOString()
+                        });
+                    }
+                });
+
+                // Handle stream end
+                response.data.on('end', () => {
+                    const duration = Date.now() - startTime;
+
+                    // Clean up the uploaded file
+                    fs.unlinkSync(req.file.path);
+
+                    // Add placeholder metrics data
+                    const metricsData = {
+                        usage: {
+                            prompt_tokens: prompt ? prompt.split(/\s+/).length : 0,
+                            completion_tokens: outputTokens,
+                            total_tokens: outputTokens + (prompt ? prompt.split(/\s+/).length : 0)
+                        }
+                    };
+
+                    updateMetrics(node, model, startTime, metricsData);
+
+                    logger.info({
+                        message: 'Vision stream completed',
+                        requestId,
+                        model,
+                        node,
+                        duration: `${duration}ms`,
+                        outputTokens,
+                        responseLength: fullResponse.length,
+                        timestamp: new Date().toISOString()
+                    });
+
+                    // End the response
+                    res.end();
+                });
+
+                // Handle stream error
+                response.data.on('error', (error) => {
+                    // Clean up the uploaded file on error
+                    if (req.file && req.file.path) {
+                        fs.unlinkSync(req.file.path);
+                    }
+
+                    logger.error({
+                        message: 'Vision stream error',
+                        requestId,
+                        error: error.message,
+                        timestamp: new Date().toISOString()
+                    });
+
+                    updateMetrics(node, model, startTime, null, true);
+
+                    // Send error to client and end stream
+                    res.write(JSON.stringify({ error: error.message }));
+                    res.end();
+                });
+            } catch (error) {
+                // Clean up the uploaded file on error
+                if (req.file && req.file.path) {
+                    fs.unlinkSync(req.file.path);
+                }
+
+                // Handle Axios errors
+                updateMetrics(node, model, startTime, null, true);
+                logger.error({
+                    message: 'Vision stream API call failed',
+                    requestId,
+                    model,
+                    node,
+                    error: error.message,
+                    errorCode: error.code,
+                    errorResponse: error.response ? {
+                        status: error.response.status,
+                        statusText: error.response.statusText,
+                        data: error.response.data
+                    } : 'No response',
+                    duration: `${Date.now() - startTime}ms`,
+                    timestamp: new Date().toISOString()
+                });
+
+                // Send error to client and end stream
+                res.write(JSON.stringify({ error: error.message }));
+                res.end();
+            }
+        }).catch(error => {
+            // Clean up the uploaded file on error
+            if (req.file && req.file.path) {
+                fs.unlinkSync(req.file.path);
+            }
+
+            // Handle queue errors
+            logger.error({
+                message: 'Queue error for vision stream',
+                requestId,
+                error: error.message,
+                stack: error.stack,
+                timestamp: new Date().toISOString()
+            });
+
+            // Send error to client and end stream
+            res.write(JSON.stringify({ error: error.message }));
+            res.end();
+        });
+    } catch (error) {
+        // Clean up the uploaded file on error
+        if (req.file && req.file.path) {
+            fs.unlinkSync(req.file.path);
+        }
+
+        // Handle uncaught errors
+        logger.error({
+            message: 'Uncaught error in vision stream',
+            requestId,
+            error: error.message,
+            stack: error.stack,
+            timestamp: new Date().toISOString()
+        });
+
+        // Send error to client and end stream
+        res.write(JSON.stringify({ error: error.message }));
+        res.end();
+    }
+});
+
+app.post('/vision', upload.single('image'), async (req, res) => {
+    const requestId = req.id;
+    const startTime = Date.now();
+    const model = req.body.model || 'llava:13b'; // Default to LLaVA
+    const prompt = req.body.prompt || 'Describe this image in detail';
+    const node = req.body.node || 'unknown';
+
+    // Enhanced vision request logging
+    logger.info({
+        message: 'Vision analysis request received',
+        requestId,
+        model,
+        node,
+        prompt,
+        imageSize: req.file ? req.file.size : 'No file uploaded',
+        timestamp: new Date().toISOString()
+    });
+
+    if (!req.file) {
+        logger.error({
+            message: 'No image file provided',
+            requestId,
+            timestamp: new Date().toISOString()
+        });
+        return res.status(400).json({ status: 'error', message: 'No image file provided' });
+    }
+
+    if (!queue) {
+        logger.error({
+            message: 'Queue not initialized',
+            requestId,
+            reason: 'Server still initializing',
+            timestamp: new Date().toISOString()
+        });
+        return res.status(503).json({ status: 'error', message: 'Server initializing' });
+    }
+
+    try {
+        logger.info({
+            message: 'Adding vision analysis request to queue',
+            requestId,
+            model,
+            queueSize: queue.size,
+            queuePending: queue.pending,
+            timestamp: new Date().toISOString()
+        });
+
+        const queueStartTime = Date.now();
+        const result = await queue.add(async () => {
+            const queueWaitTime = Date.now() - queueStartTime;
+
+            logger.info({
+                message: 'Executing vision analysis request',
+                requestId,
+                model,
+                node,
+                queueWaitTime: `${queueWaitTime}ms`,
+                startTime: new Date(startTime).toISOString(),
+                timestamp: new Date().toISOString()
+            });
+
+            try {
+                // Read the image file and convert to base64
+                const imageBuffer = fs.readFileSync(req.file.path);
+                const base64Image = imageBuffer.toString('base64');
+
+                // Prepare the request for Ollama
+                const requestBody = {
+                    model: model,
+                    messages: [
+                        {
+                            role: 'user',
+                            content: prompt,
+                            images: [base64Image]
+                        }
+                    ]
+                };
+
+                // Log API call attempt
+                logger.info({
+                    message: 'Making vision analysis API call',
+                    requestId,
+                    endpoint: `${LLAMA_BASE_URL}/chat`,
+                    method: 'POST',
+                    model,
+                    timestamp: new Date().toISOString()
+                });
+
+                const response = await axios.post(`${LLAMA_BASE_URL}/chat`, requestBody);
+
+                // Clean up the uploaded file
+                fs.unlinkSync(req.file.path);
+
+                // Extract usage metrics for enhanced logging
+                const usage = response.data.usage || {};
+                const inputTokens = usage.prompt_tokens || 0;
+                const outputTokens = usage.completion_tokens || 0;
+                const totalTokens = usage.total_tokens || inputTokens + outputTokens;
+                const duration = Date.now() - startTime;
+                const tokensPerSecond = outputTokens > 0 ? (outputTokens / (duration / 1000)).toFixed(2) : 0;
+
+                updateMetrics(node, model, startTime, response.data);
+
+                // Enhanced successful API call logging
+                logger.info({
+                    message: 'Vision analysis API call successful',
+                    requestId,
+                    model,
+                    node,
+                    duration: `${duration}ms`,
+                    responseSize: JSON.stringify(response.data).length,
+                    promptTokens: inputTokens,
+                    completionTokens: outputTokens,
+                    totalTokens,
+                    tokensPerSecond: `${tokensPerSecond} tokens/sec`,
+                    timestamp: new Date().toISOString()
+                });
+                return response;
+            } catch (error) {
+                // Clean up the uploaded file on error
+                if (req.file && req.file.path) {
+                    fs.unlinkSync(req.file.path);
+                }
+
+                // Enhanced error logging for API call failures
+                updateMetrics(node, model, startTime, null, true);
+                logger.error({
+                    message: 'Vision analysis API call failed',
+                    requestId,
+                    model,
+                    node,
+                    error: error.message,
+                    errorCode: error.code,
+                    errorResponse: error.response ? {
+                        status: error.response.status,
+                        statusText: error.response.statusText,
+                        data: error.response.data
+                    } : 'No response',
+                    duration: `${Date.now() - startTime}ms`,
+                    timestamp: new Date().toISOString()
+                });
+                throw error;
+            }
+        });
+
+        logger.info({
+            message: 'Vision analysis request successful',
+            requestId,
+            model,
+            node,
+            duration: `${Date.now() - startTime}ms`,
+            timestamp: new Date().toISOString()
+        });
+
+        res.json(result.data);
+    } catch (error) {
+        // Clean up the uploaded file on error
+        if (req.file && req.file.path) {
+            fs.unlinkSync(req.file.path);
+        }
+
+        logger.error({
+            message: 'Vision analysis request failed',
+            requestId,
+            model,
+            node,
+            error: error.message,
+            stack: error.stack,
+            duration: `${Date.now() - startTime}ms`,
+            timestamp: new Date().toISOString()
+        });
+
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
 
 // Health check endpoint
 app.get('/health', async (req, res) => {
