@@ -9,7 +9,6 @@ const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 
-// Get server identity information
 const SERVER_ID = {
     hostname: os.hostname(),
     ipAddress: ip.address(),
@@ -91,7 +90,7 @@ const upload = multer({
 });
 
 const app = express();
-app.use(express.json({ limit: '50mb' })); // Add limit to prevent large request body issues
+app.use(express.json({ limit: '50mb' }));
 
 let queue;
 
@@ -840,6 +839,912 @@ app.post('/vision', upload.single('image'), async (req, res) => {
         res.status(500).json({ status: 'error', message: error.message });
     }
 });
+
+const supportedExtensions = [
+    '.txt', '.pdf', '.docx', '.doc', '.xlsx', '.xls', '.csv', '.json', '.rtf',
+    '.java', '.kt', '.swift', '.js', '.ts', '.py', '.cpp', '.c', '.cs',
+    '.go', '.rb', '.php', '.rs', '.scala', '.m', '.dart', '.groovy',
+    '.lua', '.pl', '.r', '.sql', '.yaml', '.yml', '.toml', '.md',
+    '.html', '.htm', '.css', '.xml', '.jsx', '.tsx', '.json5'
+];
+
+// Fix the file filter function to properly reference req.file instead of 'file'
+const documentUpload = multer({
+    dest: 'uploads/',
+    limits: {
+        fileSize: 50 * 1024 * 1024, // Limit to 50MB for documents
+    },
+    fileFilter: (req, file, cb) => {
+        // Determine file extension
+        const fileExtension = path.extname(file.originalname).toLowerCase();
+
+        // Accept document files by MIME type or extension
+        const allowedMimes = [
+            // Existing document types
+            'text/plain',
+            'application/pdf',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'application/msword',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'application/vnd.ms-excel',
+            'text/csv',
+            'application/json',
+            'application/rtf',
+            'text/rtf',
+
+            // Programming language source files
+            'text/x-java-source',               // Java
+            'text/x-kotlin',                    // Kotlin
+            'text/x-swift',                     // Swift
+            'application/javascript',           // JavaScript
+            'text/javascript',                  // JavaScript (alternate)
+            'application/typescript',           // TypeScript
+            'text/x-python',                    // Python
+            'text/x-c++src',                    // C++
+            'text/x-csrc',                      // C
+            'text/x-csharp',                    // C#
+            'text/x-go',                        // Go
+            'text/x-ruby',                      // Ruby
+            'text/x-php',                       // PHP
+            'text/x-rust',                      // Rust
+            'text/x-scala',                     // Scala
+            'text/x-objcsrc',                   // Objective-C
+            'text/x-dart',                      // Dart
+            'text/x-groovy',                    // Groovy
+            'text/x-lua',                       // Lua
+            'text/x-perl',                      // Perl
+            'text/x-r',                         // R
+            'text/x-sql',                       // SQL
+            'text/x-yaml',                      // YAML
+            'text/x-toml',                      // TOML
+            'text/markdown',                    // Markdown
+            'text/html',                        // HTML
+            'text/css',                         // CSS
+            'text/xml',                         // XML
+            'application/xml',                   // XML (alternate)
+            'application/octet-stream'
+        ];
+
+        logger.debug({
+            message: 'File upload attempt',
+            mimetype: file.mimetype,
+            filename: file.originalname,
+            extension: fileExtension
+        });
+
+        // Accept files either by MIME type or by file extension
+        if (allowedMimes.includes(file.mimetype) || supportedExtensions.includes(fileExtension)) {
+            cb(null, true);
+        } else {
+            const errorMessage = `Unsupported file type: ${file.mimetype} with extension ${fileExtension}. Supported types include documents and programming language source files.`;
+            logger.warn({
+                message: 'File upload rejected',
+                mimetype: file.mimetype,
+                filename: file.originalname,
+                extension: fileExtension,
+                reason: errorMessage
+            });
+            cb(new Error(errorMessage), false);
+        }
+    }
+});
+
+// Document extraction endpoint using the document-specific upload middleware
+app.post('/document/extract', documentUpload.single('document'), async (req, res) => {
+    const requestId = req.id;
+    const startTime = Date.now(); // Define startTime here to fix the reference error
+
+    logger.info({
+        message: 'Document text extraction request received',
+        requestId,
+        fileSize: req.file ? req.file.size : 'No file uploaded',
+        contentType: req.file ? req.file.mimetype : 'unknown',
+        fileName: req.file ? req.file.originalname : 'No file',
+        timestamp: new Date().toISOString()
+    });
+
+    if (!req.file) {
+        return res.status(400).json({
+            status: 'error',
+            message: 'No document file provided'
+        });
+    }
+
+    if (!queue) {
+        logger.error({
+            message: 'Queue not initialized',
+            requestId,
+            reason: 'Server still initializing',
+            timestamp: new Date().toISOString()
+        });
+        return res.status(503).json({ status: 'error', message: 'Server initializing' });
+    }
+
+    try {
+        logger.info({
+            message: 'Adding document extraction request to queue',
+            requestId,
+            fileType: req.file.mimetype,
+            queueSize: queue.size,
+            queuePending: queue.pending,
+            timestamp: new Date().toISOString()
+        });
+
+        const result = await queue.add(async () => {
+            logger.info({
+                message: 'Executing document extraction request',
+                requestId,
+                startTime: new Date(startTime).toISOString(),
+                timestamp: new Date().toISOString()
+            });
+
+            try {
+                // Extract text using appropriate method
+                const text = await extractTextFromFile(req.file.path, req.file.mimetype, req.file.originalname);
+
+                logger.info({
+                    message: 'Document extraction successful',
+                    requestId,
+                    contentType: req.file.mimetype,
+                    originalSize: req.file.size,
+                    extractedLength: text.length,
+                    duration: `${Date.now() - startTime}ms`,
+                    timestamp: new Date().toISOString()
+                });
+
+                return {
+                    status: 'ok',
+                    data: {
+                        text: text,
+                        metadata: {
+                            originalSize: req.file.size,
+                            extractedLength: text.length,
+                            mimeType: req.file.mimetype,
+                            fileName: req.file.originalname,
+                            processingTimeMs: Date.now() - startTime
+                        }
+                    }
+                };
+            } catch (error) {
+                logger.error({
+                    message: 'Document extraction failed',
+                    requestId,
+                    fileType: req.file.mimetype,
+                    fileName: req.file.originalname,
+                    error: error.message,
+                    stack: error.stack,
+                    duration: `${Date.now() - startTime}ms`,
+                    timestamp: new Date().toISOString()
+                });
+
+                throw error;
+            }
+        });
+
+        // Return the extracted text
+        res.json(result);
+    } catch (error) {
+        logger.error({
+            message: 'Document extraction request failed',
+            requestId,
+            error: error.message,
+            stack: error.stack,
+            duration: `${Date.now() - startTime}ms`,
+            timestamp: new Date().toISOString()
+        });
+
+        res.status(500).json({
+            status: 'error',
+            message: `Failed to extract text: ${error.message}`
+        });
+    } finally {
+        // Clean up the temporary file
+        try {
+            if (req.file && req.file.path) {
+                fs.unlinkSync(req.file.path);
+            }
+        } catch (deleteError) {
+            logger.error({
+                message: 'Failed to delete temporary file',
+                requestId,
+                filePath: req.file ? req.file.path : 'unknown',
+                error: deleteError.message,
+                timestamp: new Date().toISOString()
+            });
+        }
+    }
+});
+
+// Comprehensive text extraction function supporting multiple file formats
+async function extractTextFromFile(filePath, mimeType, fileName) {
+    const codeExtensions = [
+        '.java', '.kt', '.swift', '.js', '.ts', '.py', '.cpp', '.c', '.cs',
+        '.go', '.rb', '.php', '.rs', '.scala', '.m', '.dart', '.groovy',
+        '.lua', '.pl', '.r', '.sql', '.yaml', '.yml', '.toml', '.md',
+        '.html', '.htm', '.css', '.xml', '.jsx', '.tsx', '.json5'
+    ];
+
+    // Start timing for metrics
+    const startTime = Date.now();
+
+    // Determine file extension
+    const fileExtension = path.extname(fileName).toLowerCase();
+
+    logger.debug({
+        message: 'Extracting text from file',
+        mimetype: mimeType,
+        filename: fileName,
+        extension: fileExtension
+    });
+
+    // Handle code files by direct reading (moved to top to ensure it catches all code files)
+    if (codeExtensions.includes(fileExtension) ||
+        mimeType.startsWith('text/x-') ||
+        mimeType === 'application/javascript' ||
+        mimeType === 'text/javascript' ||
+        mimeType === 'application/typescript') {
+        try {
+            const content = fs.readFileSync(filePath, 'utf8');
+            logger.debug({
+                message: `Extracted text from ${fileExtension.substring(1) || mimeType} source file`,
+                method: 'direct read',
+                duration: `${Date.now() - startTime}ms`
+            });
+            return content;
+        } catch (error) {
+            logger.error({
+                message: `Failed to read ${fileExtension.substring(1) || mimeType} source file`,
+                error: error.message
+            });
+            throw new Error(`Failed to extract text from source file: ${error.message}`);
+        }
+    }
+
+    // Plain text files
+    if (mimeType === 'text/plain' || fileExtension === '.txt') {
+        try {
+            const text = fs.readFileSync(filePath, 'utf8');
+            logger.debug({
+                message: 'Extracted text from plain text file',
+                method: 'direct read',
+                duration: `${Date.now() - startTime}ms`
+            });
+            return text;
+        } catch (error) {
+            logger.error({
+                message: 'Failed to read text file',
+                error: error.message
+            });
+            throw new Error(`Failed to read text file: ${error.message}`);
+        }
+    }
+
+    // PDF files - enhanced error handling with multiple fallback methods
+    if (mimeType === 'application/pdf' || fileExtension === '.pdf') {
+        try {
+            // Read the file
+            const dataBuffer = fs.readFileSync(filePath);
+
+            // Method 1: Try pdf-parse
+            try {
+                const pdfParser = require('pdf-parse');
+                const data = await pdfParser(dataBuffer);
+
+                logger.debug({
+                    message: 'Extracted text from PDF file using pdf-parse',
+                    method: 'pdf-parse',
+                    pageCount: data.numpages,
+                    duration: `${Date.now() - startTime}ms`
+                });
+
+                return data.text;
+            } catch (pdfParseError) {
+                logger.warn({
+                    message: 'PDF parsing with pdf-parse failed, trying pdfjs',
+                    error: pdfParseError.message
+                });
+
+                // Method 2: Try pdfjs-dist
+                try {
+                    const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
+
+                    let text = '';
+                    const doc = await pdfjsLib.getDocument({ data: dataBuffer }).promise;
+                    const numPages = doc.numPages;
+
+                    for (let i = 1; i <= numPages; i++) {
+                        const page = await doc.getPage(i);
+                        const content = await page.getTextContent();
+                        text += content.items.map(item => item.str).join(' ') + '\n\n';
+                    }
+
+                    logger.debug({
+                        message: 'Extracted text from PDF file using pdfjs',
+                        method: 'pdfjs',
+                        pageCount: numPages,
+                        duration: `${Date.now() - startTime}ms`
+                    });
+
+                    return text;
+                } catch (pdfjsError) {
+                    logger.warn({
+                        message: 'PDF parsing with pdfjs failed, trying pdf2json',
+                        error: pdfjsError.message
+                    });
+
+                    // Method 3: Try pdf2json
+                    try {
+                        const PDF2JSON = require('pdf2json');
+                        const pdfParser = new PDF2JSON();
+
+                        const text = await new Promise((resolve, reject) => {
+                            pdfParser.on("pdfParser_dataError", errData => reject(new Error(errData.parserError)));
+                            pdfParser.on("pdfParser_dataReady", pdfData => {
+                                try {
+                                    let text = '';
+                                    for (let i = 0; i < pdfData.Pages.length; i++) {
+                                        const page = pdfData.Pages[i];
+                                        const pageText = page.Texts.map(textObject => {
+                                            return decodeURIComponent(textObject.R.map(r => r.T).join(' '));
+                                        }).join(' ');
+                                        text += pageText + '\n\n';
+                                    }
+                                    resolve(text);
+                                } catch (err) {
+                                    reject(err);
+                                }
+                            });
+
+                            pdfParser.parseBuffer(dataBuffer);
+                        });
+
+                        logger.debug({
+                            message: 'Extracted text from PDF file using pdf2json',
+                            method: 'pdf2json',
+                            duration: `${Date.now() - startTime}ms`
+                        });
+
+                        return text;
+                    } catch (pdf2jsonError) {
+                        logger.warn({
+                            message: 'PDF parsing with pdf2json failed, trying textract',
+                            error: pdf2jsonError.message
+                        });
+
+                        // Method 4: Last resort, try textract
+                        try {
+                            const textractText = await extractWithTextract(filePath, mimeType);
+                            return textractText;
+                        } catch (textractError) {
+                            logger.error({
+                                message: 'All PDF extraction methods failed',
+                                errors: {
+                                    pdfParse: pdfParseError.message,
+                                    pdfjs: pdfjsError.message,
+                                    pdf2json: pdf2jsonError.message,
+                                    textract: textractError.message
+                                }
+                            });
+
+                            // No methods worked, but let's try a simple text extraction
+                            // as a last fallback for simple PDF files
+                            try {
+                                // Try to read it as plain text (works for some simple PDFs)
+                                const rawText = dataBuffer.toString('utf8');
+                                // Only return if we have something that looks like text
+                                if (rawText.replace(/[^a-zA-Z0-9]/g, '').length > 50) {
+                                    logger.debug({
+                                        message: 'Extracted text from PDF using raw buffer conversion',
+                                        method: 'raw_buffer',
+                                        duration: `${Date.now() - startTime}ms`
+                                    });
+                                    return rawText;
+                                }
+                                throw new Error('Raw text extraction produced insufficient results');
+                            } catch (rawError) {
+                                // If we get here, nothing worked
+                                throw new Error(`All PDF extraction methods failed: ${pdfParseError.message}`);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (error) {
+            logger.error({
+                message: 'PDF file read or extraction error',
+                error: error.message
+            });
+            throw new Error(`Failed to extract text from PDF: ${error.message}`);
+        }
+    }
+
+    // DOCX files
+    if (mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
+        fileExtension === '.docx') {
+        try {
+            const mammoth = require('mammoth');
+            const result = await mammoth.extractRawText({ path: filePath });
+            logger.debug({
+                message: 'Extracted text from DOCX file',
+                method: 'mammoth',
+                duration: `${Date.now() - startTime}ms`
+            });
+            return result.value;
+        } catch (error) {
+            logger.error({
+                message: 'Failed to extract text from DOCX',
+                error: error.message
+            });
+            throw new Error(`Failed to extract text from DOCX: ${error.message}`);
+        }
+    }
+
+    // DOC files (old Word format)
+    if (mimeType === 'application/msword' || fileExtension === '.doc') {
+        return await extractWithTextract(filePath, mimeType);
+    }
+
+    // Excel files
+    if (mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+        mimeType === 'application/vnd.ms-excel' ||
+        fileExtension === '.xlsx' ||
+        fileExtension === '.xls') {
+        try {
+            const XLSX = require('xlsx');
+            const workbook = XLSX.readFile(filePath, {
+                cellDates: true,
+                cellNF: true
+            });
+
+            let text = '';
+            for (const sheet of workbook.SheetNames) {
+                const worksheet = workbook.Sheets[sheet];
+                text += `Sheet: ${sheet}\n`;
+
+                // Convert sheet to JSON for easier processing
+                const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+
+                // Format as text
+                for (const row of jsonData) {
+                    if (row.length > 0) {
+                        text += row.join('\t') + '\n';
+                    }
+                }
+                text += '\n\n';
+            }
+
+            logger.debug({
+                message: 'Extracted text from Excel file',
+                method: 'xlsx',
+                sheets: workbook.SheetNames.length,
+                duration: `${Date.now() - startTime}ms`
+            });
+
+            return text;
+        } catch (error) {
+            logger.error({
+                message: 'Failed to extract text from Excel',
+                error: error.message
+            });
+            throw new Error(`Failed to extract text from Excel: ${error.message}`);
+        }
+    }
+
+    // CSV files
+    if (mimeType === 'text/csv' || fileExtension === '.csv') {
+        try {
+            const content = fs.readFileSync(filePath, 'utf8');
+            logger.debug({
+                message: 'Extracted text from CSV file',
+                method: 'direct read',
+                duration: `${Date.now() - startTime}ms`
+            });
+            return content;
+        } catch (error) {
+            logger.error({
+                message: 'Failed to read CSV file',
+                error: error.message
+            });
+            throw new Error(`Failed to extract text from CSV: ${error.message}`);
+        }
+    }
+
+    // JSON files
+    if (mimeType === 'application/json' || fileExtension === '.json') {
+        try {
+            const content = fs.readFileSync(filePath, 'utf8');
+            logger.debug({
+                message: 'Extracted text from JSON file',
+                method: 'direct read',
+                duration: `${Date.now() - startTime}ms`
+            });
+            return content;
+        } catch (error) {
+            logger.error({
+                message: 'Failed to read JSON file',
+                error: error.message
+            });
+            throw new Error(`Failed to extract text from JSON file: ${error.message}`);
+        }
+    }
+
+    // RTF files
+    if (mimeType === 'application/rtf' || fileExtension === '.rtf') {
+        return await extractWithTextract(filePath, mimeType);
+    }
+
+    // For all other file types, try direct read first
+    try {
+        const content = fs.readFileSync(filePath, 'utf8');
+        logger.debug({
+            message: 'Extracted text using direct read',
+            mimeType,
+            duration: `${Date.now() - startTime}ms`
+        });
+        return content;
+    } catch (directReadError) {
+        // If direct read fails, try textract as last resort
+        try {
+            return await extractWithTextract(filePath, mimeType);
+        } catch (textractError) {
+            logger.error({
+                message: 'All extraction methods failed',
+                mimeType,
+                directReadError: directReadError.message,
+                textractError: textractError.message
+            });
+            throw new Error(`Unable to extract text from file: ${textractError.message}`);
+        }
+    }
+}
+
+// Helper function to extract text using textract
+async function extractWithTextract(filePath, mimeType) {
+    const startTime = Date.now();
+
+    return new Promise((resolve, reject) => {
+        try {
+            const textract = require('textract');
+            const options = {
+                preserveLineBreaks: true,
+                preserveOnlyMultipleLineBreaks: false
+            };
+
+            textract.fromFileWithPath(filePath, options, (error, text) => {
+                if (error) {
+                    logger.error({
+                        message: 'Textract extraction failed',
+                        mimeType,
+                        error: error.message,
+                        duration: `${Date.now() - startTime}ms`
+                    });
+                    reject(new Error(`Textract extraction failed: ${error.message}`));
+                } else {
+                    logger.debug({
+                        message: 'Extracted text using textract',
+                        mimeType,
+                        duration: `${Date.now() - startTime}ms`
+                    });
+                    resolve(text);
+                }
+            });
+        } catch (error) {
+            logger.error({
+                message: 'Error initializing textract',
+                error: error.message,
+                duration: `${Date.now() - startTime}ms`
+            });
+            reject(new Error(`Textract initialization failed: ${error.message}`));
+        }
+    });
+}
+
+// New endpoint for processing document chunks
+app.post('/document/process-chunk', async (req, res) => {
+    const requestId = req.id || req.headers['x-request-id'] || uuidv4();
+    const startTime = Date.now();
+    const { chunkId, content, index, totalChunks, model, prompt } = req.body;
+
+    logger.info({
+        message: 'Document chunk processing request received',
+        requestId,
+        chunkId,
+        model,
+        chunkIndex: index,
+        totalChunks,
+        contentLength: content.length,
+        timestamp: new Date().toISOString()
+    });
+
+    if (!queue) {
+        logger.error({
+            message: 'Queue not initialized',
+            requestId,
+            reason: 'Server still initializing',
+            timestamp: new Date().toISOString()
+        });
+        return res.status(503).json({ status: 'error', message: 'Server initializing' });
+    }
+
+    try {
+        logger.info({
+            message: 'Adding chunk processing request to queue',
+            requestId,
+            chunkId,
+            model,
+            queueSize: queue.size,
+            queuePending: queue.pending,
+            timestamp: new Date().toISOString()
+        });
+
+        const result = await queue.add(async () => {
+            logger.info({
+                message: 'Executing chunk processing request',
+                requestId,
+                chunkId,
+                model,
+                timestamp: new Date().toISOString()
+            });
+
+            try {
+                // Create context message for the chunk
+                const contextualPrompt = `
+                ${prompt}
+                
+                IMPORTANT CONTEXT: You are analyzing chunk ${index + 1} of ${totalChunks} from a larger document.
+                
+                Document chunk content:
+                ${content}
+                
+                Process this chunk according to the instructions, knowing it's part of a larger document.
+                `;
+
+                // Prepare chat request for Ollama
+                const chatRequest = {
+                    model: model,
+                    messages: [
+                        {
+                            role: 'user',
+                            content: contextualPrompt
+                        }
+                    ]
+                };
+
+                // Make request to Ollama API
+                logger.info({
+                    message: 'Making chunk processing API call',
+                    requestId,
+                    chunkId,
+                    model,
+                    timestamp: new Date().toISOString()
+                });
+
+                const response = await axios.post(`${LLAMA_BASE_URL}/chat`, chatRequest);
+
+                // Extract assistant message
+                const assistantContent = response.data.message?.content || '';
+
+                logger.info({
+                    message: 'Chunk processing completed',
+                    requestId,
+                    chunkId,
+                    model,
+                    responseLength: assistantContent.length,
+                    duration: `${Date.now() - startTime}ms`,
+                    timestamp: new Date().toISOString()
+                });
+
+                return {
+                    status: 'ok',
+                    data: {
+                        chunkId,
+                        index,
+                        content: assistantContent,
+                        model,
+                        processingTimeMs: Date.now() - startTime
+                    }
+                };
+            } catch (error) {
+                logger.error({
+                    message: 'Chunk processing API call failed',
+                    requestId,
+                    chunkId,
+                    model,
+                    error: error.message,
+                    errorCode: error.code,
+                    errorResponse: error.response ? {
+                        status: error.response.status,
+                        statusText: error.response.statusText,
+                        data: error.response.data
+                    } : 'No response',
+                    duration: `${Date.now() - startTime}ms`,
+                    timestamp: new Date().toISOString()
+                });
+
+                throw error;
+            }
+        }).coAwait();
+
+        res.json(result);
+    } catch (error) {
+        logger.error({
+            message: 'Chunk processing request failed',
+            requestId,
+            chunkId,
+            error: error.message,
+            stack: error.stack,
+            duration: `${Date.now() - startTime}ms`,
+            timestamp: new Date().toISOString()
+        });
+
+        res.status(500).json({
+            status: 'error',
+            message: `Failed to process chunk: ${error.message}`
+        });
+    }
+});
+
+// Add synthesize endpoint for combining chunk results
+app.post('/document/synthesize', async (req, res) => {
+    const requestId = req.id || req.headers['x-request-id'] || uuidv4();
+    const startTime = Date.now();
+    const { chunkResults, originalPrompt, model } = req.body;
+
+    logger.info({
+        message: 'Document synthesis request received',
+        requestId,
+        model,
+        chunkCount: chunkResults.length,
+        timestamp: new Date().toISOString()
+    });
+
+    if (!queue) {
+        logger.error({
+            message: 'Queue not initialized',
+            requestId,
+            reason: 'Server still initializing',
+            timestamp: new Date().toISOString()
+        });
+        return res.status(503).json({ status: 'error', message: 'Server initializing' });
+    }
+
+    try {
+        logger.info({
+            message: 'Adding synthesis request to queue',
+            requestId,
+            model,
+            queueSize: queue.size,
+            queuePending: queue.pending,
+            timestamp: new Date().toISOString()
+        });
+
+        const result = await queue.add(async () => {
+            logger.info({
+                message: 'Executing synthesis request',
+                requestId,
+                model,
+                timestamp: new Date().toISOString()
+            });
+
+            try {
+                // Create synthesis prompt
+                const synthesisPrompt = createSynthesisPrompt(chunkResults, originalPrompt);
+
+                // Prepare chat request for Ollama
+                const chatRequest = {
+                    model: model,
+                    messages: [
+                        {
+                            role: 'user',
+                            content: synthesisPrompt
+                        }
+                    ]
+                };
+
+                // Make request to Ollama API
+                logger.info({
+                    message: 'Making synthesis API call',
+                    requestId,
+                    model,
+                    timestamp: new Date().toISOString()
+                });
+
+                const response = await axios.post(`${LLAMA_BASE_URL}/chat`, chatRequest);
+
+                // Extract assistant message
+                const synthesizedContent = response.data.message?.content || '';
+
+                logger.info({
+                    message: 'Synthesis completed',
+                    requestId,
+                    model,
+                    responseLength: synthesizedContent.length,
+                    duration: `${Date.now() - startTime}ms`,
+                    timestamp: new Date().toISOString()
+                });
+
+                return {
+                    status: 'ok',
+                    data: {
+                        content: synthesizedContent,
+                        metadata: {
+                            chunkCount: chunkResults.length,
+                            successfulChunks: chunkResults.filter(c => c.success !== false).length,
+                            processingTimeMs: Date.now() - startTime,
+                            synthesisModel: model
+                        }
+                    }
+                };
+            } catch (error) {
+                logger.error({
+                    message: 'Synthesis API call failed',
+                    requestId,
+                    model,
+                    error: error.message,
+                    errorCode: error.code,
+                    errorResponse: error.response ? {
+                        status: error.response.status,
+                        statusText: error.response.statusText,
+                        data: error.response.data
+                    } : 'No response',
+                    duration: `${Date.now() - startTime}ms`,
+                    timestamp: new Date().toISOString()
+                });
+
+                throw error;
+            }
+        });
+
+        res.json(result);
+    } catch (error) {
+        logger.error({
+            message: 'Synthesis request failed',
+            requestId,
+            error: error.message,
+            stack: error.stack,
+            duration: `${Date.now() - startTime}ms`,
+            timestamp: new Date().toISOString()
+        });
+
+        res.status(500).json({
+            status: 'error',
+            message: `Failed to synthesize results: ${error.message}`
+        });
+    }
+});
+
+// Helper function to create synthesis prompt
+function createSynthesisPrompt(chunkResults, originalPrompt) {
+    const sb = [];
+
+    sb.push(`
+    You are synthesizing analysis from multiple chunks of a document. Your task is to create a coherent response that integrates the analysis of all chunks.
+    
+    Original request: ${originalPrompt}
+    
+    Below are the analyses of ${chunkResults.length} document chunks, in order:
+    `.trim());
+
+    // Include each chunk's content
+    chunkResults
+        .sort((a, b) => a.index - b.index)
+        .forEach((result, index) => {
+            sb.push(`\n--- CHUNK ${index + 1} ANALYSIS ---`);
+            sb.push(result.content || "[No content available for this chunk]");
+        });
+
+    sb.push(`
+    
+    INSTRUCTIONS:
+    1. Synthesize a coherent response that addresses the original request based on all document chunks
+    2. Eliminate redundancies and resolve any contradictions between chunk analyses
+    3. Provide a comprehensive answer that flows naturally as if the document was processed as a whole
+    4. Do not mention chunks or the chunking process in your response
+    5. Format your response appropriately for the type of analysis requested
+    `.trim());
+
+    return sb.join('\n');
+}
 
 // Health check endpoint
 app.get('/health', async (req, res) => {
