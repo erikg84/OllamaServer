@@ -1439,14 +1439,42 @@ async function extractWithTextract(filePath, mimeType) {
     });
 }
 
-// New endpoint for processing document chunks
 app.post('/document/process-chunk', async (req, res) => {
     const requestId = req.id || req.headers['x-request-id'] || uuidv4();
     const startTime = Date.now();
-    const { chunkId, content, index, totalChunks, model, prompt } = req.body;
 
     logger.info({
         message: 'Document chunk processing request received',
+        requestId,
+        timestamp: new Date().toISOString()
+    });
+
+    // Validate request body
+    const { chunkId, content, index, totalChunks, model, prompt } = req.body;
+
+    // Check for required fields
+    if (!chunkId) {
+        return res.status(400).json({ status: 'error', message: 'Missing required field: chunkId' });
+    }
+    if (!content) {
+        return res.status(400).json({ status: 'error', message: 'Missing required field: content' });
+    }
+    if (index === undefined || index === null) {
+        return res.status(400).json({ status: 'error', message: 'Missing required field: index' });
+    }
+    if (totalChunks === undefined || totalChunks === null) {
+        return res.status(400).json({ status: 'error', message: 'Missing required field: totalChunks' });
+    }
+    if (!model) {
+        return res.status(400).json({ status: 'error', message: 'Missing required field: model' });
+    }
+    if (!prompt) {
+        return res.status(400).json({ status: 'error', message: 'Missing required field: prompt' });
+    }
+
+    // Log validated request
+    logger.info({
+        message: 'Document chunk processing request validated',
         requestId,
         chunkId,
         model,
@@ -1456,6 +1484,7 @@ app.post('/document/process-chunk', async (req, res) => {
         timestamp: new Date().toISOString()
     });
 
+    // Check if queue is initialized
     if (!queue) {
         logger.error({
             message: 'Queue not initialized',
@@ -1463,7 +1492,7 @@ app.post('/document/process-chunk', async (req, res) => {
             reason: 'Server still initializing',
             timestamp: new Date().toISOString()
         });
-        return res.status(503).json({ status: 'error', message: 'Server initializing' });
+        return res.status(503).json({ status: 'error', message: 'Server initializing, please try again later' });
     }
 
     try {
@@ -1500,29 +1529,165 @@ app.post('/document/process-chunk', async (req, res) => {
                 `;
 
                 // Prepare chat request for Ollama
+                // Using the appropriate format for Llama 3.2
                 const chatRequest = {
                     model: model,
                     messages: [
                         {
+                            role: 'system',
+                            content: 'You are a helpful, accurate assistant that processes document chunks.'
+                        },
+                        {
                             role: 'user',
                             content: contextualPrompt
                         }
-                    ]
+                    ],
+                    stream: false // Ensure we get a complete response, not a stream
                 };
 
-                // Make request to Ollama API
+                // Log the API call attempt with request details
                 logger.info({
                     message: 'Making chunk processing API call',
                     requestId,
                     chunkId,
                     model,
+                    url: `${LLAMA_BASE_URL}/chat`,
+                    requestPayload: {
+                        modelName: model,
+                        messagesCount: chatRequest.messages.length,
+                        promptLength: contextualPrompt.length
+                    },
                     timestamp: new Date().toISOString()
                 });
 
-                const response = await axios.post(`${LLAMA_BASE_URL}/chat`, chatRequest);
+                // Log the complete request for debugging if needed
+                logger.debug({
+                    message: 'Full Ollama API request',
+                    requestId,
+                    chunkId,
+                    request: JSON.stringify(chatRequest),
+                    timestamp: new Date().toISOString()
+                });
 
-                // Extract assistant message
-                const assistantContent = response.data.message?.content || '';
+                // Make request to Ollama API with timeout
+                let response;
+                try {
+                    response = await axios.post(`${LLAMA_BASE_URL}/chat`, chatRequest, {
+                        timeout: 60000, // 60 second timeout
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Request-ID': requestId
+                        }
+                    });
+                } catch (apiError) {
+                    // Enhanced API error handling
+                    if (apiError.code === 'ECONNREFUSED' || apiError.code === 'ECONNABORTED') {
+                        logger.error({
+                            message: 'Unable to connect to Ollama service',
+                            requestId,
+                            chunkId,
+                            error: apiError.message,
+                            code: apiError.code,
+                            timestamp: new Date().toISOString()
+                        });
+                        throw new Error('Unable to connect to AI service: connection refused or timed out');
+                    } else if (apiError.response) {
+                        // The API responded with an error status
+                        logger.error({
+                            message: 'Ollama API returned error response',
+                            requestId,
+                            chunkId,
+                            status: apiError.response.status,
+                            statusText: apiError.response.statusText,
+                            data: apiError.response.data,
+                            timestamp: new Date().toISOString()
+                        });
+                        throw new Error(`AI service error: ${apiError.response.status} ${apiError.response.statusText}`);
+                    } else if (apiError.request) {
+                        // Request was made but no response received
+                        logger.error({
+                            message: 'No response received from Ollama API',
+                            requestId,
+                            chunkId,
+                            error: apiError.message,
+                            timestamp: new Date().toISOString()
+                        });
+                        throw new Error('No response received from AI service');
+                    } else {
+                        // Something else went wrong
+                        logger.error({
+                            message: 'Unknown error while calling Ollama API',
+                            requestId,
+                            chunkId,
+                            error: apiError.message,
+                            stack: apiError.stack,
+                            timestamp: new Date().toISOString()
+                        });
+                        throw new Error(`Error processing document chunk: ${apiError.message}`);
+                    }
+                }
+
+                // Validate the response structure
+                if (!response.data || !response.data.message) {
+                    logger.error({
+                        message: 'Invalid response structure from Ollama API',
+                        requestId,
+                        chunkId,
+                        response: JSON.stringify(response.data),
+                        timestamp: new Date().toISOString()
+                    });
+                    throw new Error('Invalid response received from AI service');
+                }
+
+                // Handle different Ollama API response formats
+                let assistantContent = '';
+
+                // Log the raw response for debugging
+                logger.debug({
+                    message: 'Raw Ollama API response structure',
+                    requestId,
+                    chunkId,
+                    responseStructure: JSON.stringify(Object.keys(response.data)),
+                    timestamp: new Date().toISOString()
+                });
+
+                // Handle llama3.2 response format
+                if (response.data.message && response.data.message.content !== undefined) {
+                    // Standard chat format
+                    assistantContent = response.data.message.content;
+                } else if (response.data.response) {
+                    // Generate API format (older models or fallback)
+                    assistantContent = response.data.response;
+                } else if (response.data.content) {
+                    // Some models might return content directly
+                    assistantContent = response.data.content;
+                } else if (response.data.text) {
+                    // Some models might return text directly
+                    assistantContent = response.data.text;
+                } else {
+                    // Try to stringify the whole response as a last resort
+                    try {
+                        assistantContent = JSON.stringify(response.data);
+                    } catch (e) {
+                        logger.error({
+                            message: 'Failed to parse Ollama response',
+                            requestId,
+                            chunkId,
+                            error: e.message,
+                            timestamp: new Date().toISOString()
+                        });
+                        throw new Error('Unrecognized response format from AI service');
+                    }
+                }
+
+                if (!assistantContent) {
+                    logger.warn({
+                        message: 'Empty content received from Ollama API',
+                        requestId,
+                        chunkId,
+                        timestamp: new Date().toISOString()
+                    });
+                }
 
                 logger.info({
                     message: 'Chunk processing completed',
@@ -1546,40 +1711,54 @@ app.post('/document/process-chunk', async (req, res) => {
                 };
             } catch (error) {
                 logger.error({
-                    message: 'Chunk processing API call failed',
+                    message: 'Chunk processing failed',
                     requestId,
                     chunkId,
                     model,
                     error: error.message,
-                    errorCode: error.code,
-                    errorResponse: error.response ? {
-                        status: error.response.status,
-                        statusText: error.response.statusText,
-                        data: error.response.data
-                    } : 'No response',
+                    stack: error.stack,
                     duration: `${Date.now() - startTime}ms`,
                     timestamp: new Date().toISOString()
                 });
 
                 throw error;
             }
-        }).coAwait();
+        }, {
+            // Queue options - add priority and timeout if needed
+            priority: 1,
+            timeout: 120000 // 2 minute total timeout for the queued job
+        });
 
         res.json(result);
     } catch (error) {
+        // Check for specific error types to provide better responses
+        let statusCode = 500;
+        let errorMessage = `Failed to process chunk: ${error.message}`;
+
+        // Handle specific error cases
+        if (error.message && error.message.includes('timeout')) {
+            statusCode = 504; // Gateway Timeout
+            errorMessage = 'Processing timed out. The document chunk may be too large or complex.';
+        } else if (error.message && error.message.includes('Unable to connect')) {
+            statusCode = 503; // Service Unavailable
+            errorMessage = 'AI service is currently unavailable. Please try again later.';
+        }
+
         logger.error({
             message: 'Chunk processing request failed',
             requestId,
             chunkId,
             error: error.message,
             stack: error.stack,
+            statusCode,
             duration: `${Date.now() - startTime}ms`,
             timestamp: new Date().toISOString()
         });
 
-        res.status(500).json({
+        res.status(statusCode).json({
             status: 'error',
-            message: `Failed to process chunk: ${error.message}`
+            message: errorMessage,
+            requestId: requestId // Include requestId in response for tracking
         });
     }
 });
